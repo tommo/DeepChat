@@ -1,3 +1,9 @@
+* This is a quick test of Deepseek V3. 
+
+This Sublime Text extension is generated with Deepseek V3 free online chat, with some instructions.
+It took me one hour to build from scratch. Actually it might be a good startpoint for something more usable.
+
+Tested in Sublime Text 4
 
 ---
 
