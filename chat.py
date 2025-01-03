@@ -122,7 +122,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         try:
             with urllib.request.urlopen(request) as response:
                 while True:
-                    chunk = response.read(1024)
+                    chunk = response.read(4096)
                     if not chunk:
                         break
                     self.parse_buffer += chunk
@@ -133,15 +133,17 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                         if line:
                             try:
                                 obj_str = line.decode('utf-8')
-                                data = json.loads(obj_str[5:])
-                                choices = data.get('choices', [])
-                                if choices:
-                                    delta = choices[0].get('delta', {})
-                                    content = delta.get('content', '')
-                                    self.reply += content
-                                else:
-                                    self.reply = 'No reply from the API.'
+                                if obj_str != "data: [DONE]":
+                                    data = json.loads(obj_str[5:])
+                                    choices = data.get('choices', [])
+                                    if choices:
+                                        delta = choices[0].get('delta', {})
+                                        content = delta.get('content', '')
+                                        self.reply += content
+                                    else:
+                                        self.reply = 'No reply from the API.'
                             except ValueError as e:
+                                print(line)
                                 print("INVALID JSON", e)
                                 # Invalid JSON, skip this line
                                 continue
@@ -209,7 +211,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             result_view.set_read_only(False)
 
         # Format the messages with prefixes and empty lines
-        formatted_message = "{}\n\n".format(user_message, reply)
+        formatted_message = "{}\n\n".format(reply)
         # Append the formatted messages to the result view
         result_view.run_command('append', {'characters': formatted_message})
         # Set the cursor to the end of the view
