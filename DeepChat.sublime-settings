@@ -1,0 +1,19 @@
+{
+    // DeepSeek API Key
+    "api_key": "sk-d5727d0dcc294825abc425a4a8fb0575",
+
+    // Model to use
+    "model": "deepseek-chat",
+
+    // System message
+    "system_message": "You are a helpful assistant.",
+
+    // Maximum tokens for the response
+    "max_tokens": 100,
+
+    // Temperature for response randomness
+    "temperature": 0.1,
+
+    // Enable streaming (if supported by the API)
+    "stream": true
+}
