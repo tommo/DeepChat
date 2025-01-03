@@ -7,7 +7,8 @@ Tested in Sublime Text 4
 
 ---
 
-# DeepSeek Chat - Sublime Text Extension
+# DeepSeek Chat - Sublime Text Extension 
+*** README IS GENERATED, IT COULD BE INCORRECT ***
 
 A Sublime Text extension that integrates with the DeepSeek API to provide AI-powered chat functionality directly within the editor. This extension allows you to interact with the DeepSeek API, send messages, and receive responses in real-time, with support for streaming mode.
 
