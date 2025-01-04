@@ -39,12 +39,12 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.result_view = self.window.new_file()
             self.result_view.set_name("DeepChatResult")
             self.result_view.set_scratch(True)
-            self.result_view.set_syntax_file("Packages/Text/Plain text.tmLanguage")
             self.result_view.set_read_only(False)
+            self.result_view.assign_syntax("Packages/DeepChat/ChatResult.tmLanguage")
             self.result_view.settings().set("word_wrap", True)
-        # Clear the view content
-        self.result_view.run_command('select_all')
-        self.result_view.run_command('erase')
+        # # Clear the view content
+        # self.result_view.run_command('select_all')
+        # self.result_view.run_command('erase')
         # Show the view
         self.window.focus_view(self.result_view)
 

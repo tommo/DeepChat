@@ -15,5 +15,5 @@
     "temperature": 0.1,
 
     // Enable streaming (if supported by the API)
-    "stream": false
+    "stream": true
 }
