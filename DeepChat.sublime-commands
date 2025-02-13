@@ -2,5 +2,15 @@
     {
         "caption": "DeepSeek Chat",
         "command": "deep_seek_chat"
+    },
+    {
+        "caption": "Copy Code Block In Markdown",
+        "command": "copy_markdown_code_block"
+    },
+
+    {
+        "caption": "DeepChat: Select Model",
+        "command": "deep_chat_select_model",
+        "args": {"model_name": "loading"}
     }
 ]
