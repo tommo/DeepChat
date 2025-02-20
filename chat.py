@@ -33,6 +33,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         self.window.show_input_panel("Deep Chat:", "", self.on_done, None, None)
 
     def find_output_view(self):
+        self.result_view = None
         for view in self.window.views():
             if view.name() == "DeepChatResult":
                 self.result_view = view
@@ -99,6 +100,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
 
     def open_output_view(self):
         self.find_output_view()
+
         if not self.result_view:
             self.result_view = self.window.new_file()
             self.result_view.set_name("DeepChatResult")
@@ -109,6 +111,12 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.show_current_model()  # Show the model on creation
 
         self.window.focus_view(self.result_view)
+        if self.window.active_group() != self.window.get_view_index(self.result_view)[0]:
+            self.window.set_view_index(self.result_view, self.window.active_group(), 0)
+        self.window.run_command("focus_neighboring_group") # focus on current group
+        self.window.focus_view(self.result_view) # focus again
+        sublime.active_window().run_command("move_to_front")
+        
         if self.adding_file:
             self.result_view.run_command('append', {'characters': "\n[Attached file: {}]".format(self.adding_file)})
             self.adding_file = False
@@ -144,6 +152,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.result_view.run_command('append', {'characters': "\n[Error]: Model '{}' not found in settings.\n".format(model_name)})
 
     def show_model_list(self):
+        self.open_output_view()
         settings = sublime.load_settings('DeepChat.sublime-settings')
         available_models = settings.get('models', {})
         model_list_text = "\n==== [Available Models]:\n"
