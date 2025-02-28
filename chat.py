@@ -4,6 +4,12 @@ import urllib.parse
 import urllib.request
 import json
 import threading
+import socket
+import re
+import time
+
+
+
 
 class DeepChatSelectModelCommand(sublime_plugin.WindowCommand):
     def run(self, model_name):
@@ -255,53 +261,231 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                 sublime.error_message("An error occurred: " + str(e))
                 print("An error occurred: " + str(e))
 
+        import time
+    import re  # Add this import
+
     def stream_response(self, request):
+        """Handle streaming responses from the LLM with improved buffer handling"""
         self.reply = ''
         self.previous_reply_length = 0
+        self.last_update_time = time.time()
+        self.response_watchdog_active = True
+        self.partial_json = ""  # For handling split JSON
+        
+        # Start watchdog timer in a separate thread
+        watchdog_thread = threading.Thread(target=self._stream_watchdog)
+        watchdog_thread.daemon = True
+        watchdog_thread.start()
+        
         try:
-            with urllib.request.urlopen(request) as response:
-                while True:
-                    if self.stopping:
-                        response.close()
+            with urllib.request.urlopen(request, timeout=30) as response:
+                self.parse_buffer = b''
+                
+                while True and not self.stopping:
+                    try:
+                        # Set a short read timeout
+                        self._safely_set_timeout(response, 5)
+                        chunk = response.read(1024)  # Smaller chunks for more frequent updates
+                        self.last_update_time = time.time()
+                        
+                        if not chunk:
+                            print("End of stream reached")
+                            # Process any remaining data in buffer
+                            self._process_buffer(final=True)
+                            break
+                        
+                        # Append to buffer and process
+                        self.parse_buffer += chunk
+                        self._process_buffer()
+                        
+                        # Start UI update timer if not already running
+                        if not self.timer_running:
+                            sublime.set_timeout(self.update_view, 100)
+                            self.timer_running = True
+                        
+                    except (socket.timeout, socket.error) as e:
+                        print("Socket timeout or error:", str(e))
+                        # Try again (watchdog will handle true hangs)
+                        continue
+                        
+                    except Exception as e:
+                        print("Stream error:", str(e))
                         break
-                    chunk = response.read(4096)
-                    if not chunk: break
-                    self.parse_buffer += chunk
-                    lines = self.parse_buffer.split(b'\n')
-                    self.parse_buffer = lines[-1]
-                    for line in lines[:-1]:
-                        if line:
-                            try:
-                                obj_str = line.decode('utf-8')
-                                if obj_str != "data: [DONE]":
-                                    data = json.loads(obj_str[5:])
-                                    choices = data.get('choices', [])
-                                    if choices:
-                                        delta = choices[0].get('delta', {})
-                                        content = delta.get('content', '')
-                                        if content != None:
-                                            self.reply += content
-                                    else:
-                                        self.reply = 'No reply from the API.'
-                            except ValueError as e:
-                                print(line)
-                                print("INVALID JSON", e)
-                                continue
-                    if not self.timer_running:
-                        sublime.set_timeout(self.update_view, 100)
-                        self.timer_running = True
+        
+        except Exception as e:
+            print("Connection error:", str(e))
+            if not self.reply:
+                self.reply = "Error connecting to model: " + str(e)
+        
+        finally:
+            # Clean up and ensure final update
+            self.response_watchdog_active = False
+            self._process_partial_json()  # Process any remaining partial JSON
+            
+            if self.reply:
                 self.response_complete = True
                 self.history.append({'role': 'assistant', 'content': self.reply})
                 sublime.set_timeout(lambda: self.update_view(final=True), 0)
-        except urllib.error.HTTPError as e:
-            sublime.error_message("HTTP Error: %d - %s" % (e.code, e.reason))
-            print("HTTP Error: %d - %s" % (e.code, e.reason))
-        except urllib.error.URLError as e:
-            sublime.error_message("URL Error: %s" % e.reason)
-            print("URL Error: %s" % e.reason)
+
+    def _process_buffer(self, final=False):
+        """Process the current buffer with improved JSON handling"""
+        # Split on newlines but maintain buffer integrity
+        if b'\n' in self.parse_buffer:
+            lines = self.parse_buffer.split(b'\n')
+            self.parse_buffer = lines.pop()  # Keep incomplete line in buffer
+            
+            for line in lines:
+                self._process_line(line)
+        elif final:
+            # Process any remaining data if this is the final call
+            self._process_line(self.parse_buffer)
+            self.parse_buffer = b''
+
+    def _process_line(self, line):
+        """Process a single line with improved JSON parsing"""
+        if not line.strip():
+            return
+        
+        try:
+            line_str = line.decode('utf-8', errors='replace').strip()
+            
+            # Handle SSE format (data: {...})
+            if line_str.startswith('data: '):
+                if line_str == "data: [DONE]":
+                    return
+                
+                json_str = line_str[6:]  # Remove 'data: ' prefix
+                self._handle_json_content(json_str)
+            
+            # Handle raw JSON lines
+            elif line_str.startswith('{'):
+                self._handle_json_content(line_str)
+                
         except Exception as e:
-            sublime.error_message("An error occurred: " + str(e))
-            raise e
+            print("Error processing line:", str(e), "Line:", line)
+
+    def _handle_json_content(self, json_str):
+        """Handle JSON content with support for partial JSON"""
+        try:
+            # Try to parse as complete JSON
+            data = json.loads(json_str)
+            self._extract_content(data)
+            
+        except ValueError:
+            # This might be a partial JSON object
+            self.partial_json += json_str
+            
+            # Try to extract complete JSON objects from the accumulated partial JSON
+            self._process_partial_json()
+
+    def _process_partial_json(self):
+        """Process accumulated partial JSON content"""
+        if not self.partial_json:
+            return
+            
+        # Look for complete JSON objects using regex
+        pattern = r'(\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\})'
+        matches = re.findall(pattern, self.partial_json)
+        
+        for match in matches:
+            try:
+                data = json.loads(match)
+                self._extract_content(data)
+                # Remove this object from partial_json
+                self.partial_json = self.partial_json.replace(match, '', 1)
+            except ValueError:
+                pass  # Not valid JSON
+
+    def _extract_content(self, data):
+        """Extract content with expanded format handling"""
+        # Check for OpenAI/Anthropic style format
+        if 'choices' in data:
+            choices = data.get('choices', [])
+            if choices and len(choices) > 0:
+                choice = choices[0]
+                
+                # OpenAI streaming format
+                if 'delta' in choice:
+                    delta = choice.get('delta', {})
+                    if 'content' in delta:
+                        content = delta.get('content')
+                        if content is not None:
+                            self.reply += content
+                
+                # Regular format
+                elif 'message' in choice:
+                    message = choice.get('message', {})
+                    if 'content' in message:
+                        content = message.get('content')
+                        if content is not None:
+                            self.reply += content
+                
+                # Text completion format
+                elif 'text' in choice:
+                    text = choice.get('text')
+                    if text is not None:
+                        self.reply += text
+        
+        # Sonnet and other non-standard formats
+        elif 'text' in data:
+            text = data.get('text')
+            if text is not None:
+                self.reply += text
+        
+        elif 'content' in data:
+            content = data.get('content')
+            if content is not None:
+                self.reply += content
+                
+        # Claude/Anthropic format
+        elif 'completion' in data:
+            completion = data.get('completion')
+            if completion is not None:
+                self.reply += completion
+                
+        # Mistral/Mixtral format
+        elif 'response' in data:
+            response = data.get('response')
+            if response is not None:
+                self.reply += response
+
+    def _stream_watchdog(self):
+        """Watchdog timer to detect and recover from stream hangs"""
+        while self.response_watchdog_active:
+            time.sleep(1)  # Check every second
+            
+            current_time = time.time()
+            elapsed = current_time - self.last_update_time
+            
+            # If more than 15 seconds without updates, consider it hanging
+            if elapsed > 15 and not self.response_complete:
+                print("Watchdog detected potential hang after", elapsed, "seconds")
+                self.response_watchdog_active = False
+                
+                # Force completion of the response
+                if self.reply:
+                    sublime.set_timeout(lambda: self._handle_hang(), 0)
+                return
+
+    def _handle_hang(self):
+        """Handle a detected stream hang"""
+        if not self.response_complete:
+            self.reply += "\n\n[Response incomplete - stream timed out]"
+            self.response_complete = True
+            self.stopping = True
+            self.history.append({'role': 'assistant', 'content': self.reply})
+            self.update_view(final=True)
+
+    def _safely_set_timeout(self, response, timeout=10):
+        """Safely set timeout on socket if available"""
+        try:
+            if hasattr(response, 'fp') and response.fp is not None:
+                if hasattr(response.fp, 'raw') and response.fp.raw is not None:
+                    if hasattr(response.fp.raw, '_sock') and response.fp.raw._sock is not None:
+                        response.fp.raw._sock.settimeout(timeout)
+        except Exception as e:
+            print("Could not set socket timeout:", str(e))
+
 
     def update_view(self, final=False):
         if not self.timer_running and not final: return
