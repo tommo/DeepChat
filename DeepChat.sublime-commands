@@ -10,7 +10,11 @@
 
     {
         "caption": "DeepChat: Select Model",
-        "command": "deep_chat_select_model",
-        "args": {"model_name": "loading"}
+        "command": "deep_chat_select_model"
+    },
+
+    {
+        "caption": "DeepChat: Add Current File To Context",
+        "command": "deep_chat_insert_file"
     }
 ]

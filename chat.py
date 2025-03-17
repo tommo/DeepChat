@@ -9,12 +9,44 @@ import re
 import time
 
 
-
+class DeepChatInsertFileCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        active_view = self.window.active_view()
+        if active_view and active_view.file_name():
+            file_path = active_view.file_name()
+            self.window.run_command("deep_seek_chat", {"add_file":file_path})
+        else:
+            sublime.status_message("No active file")
 
 class DeepChatSelectModelCommand(sublime_plugin.WindowCommand):
-    def run(self, model_name):
-        if model_name != "loading":
-            self.window.active_view().run_command("deep_seek_chat", {"command":"set_model", "model_name": model_name})
+    def run(self):
+        settings = sublime.load_settings('DeepChat.sublime-settings')
+        available_models = settings.get('models', {})
+        
+        if not available_models:
+            sublime.status_message("No models defined in settings")
+            return
+            
+        self.models = []
+        self.model_names = []
+        
+        for model_name, model_config in available_models.items():
+            self.model_names.append(model_name)
+            description = model_config.get('description', '...')
+            self.models.append([model_name, description])
+            
+        self.window.show_quick_panel(
+            self.models, 
+            self.on_selected,
+            sublime.MONOSPACE_FONT
+        )
+    
+    def on_selected(self, index):
+        if index == -1:  # User cancelled
+            return
+            
+        selected_model = self.model_names[index]
+        self.window.run_command("deep_seek_chat", {"command": "set_model", "model_name": selected_model})
 
 class DeepSeekChatCommand(sublime_plugin.WindowCommand):
     def __init__(self, view):
@@ -32,8 +64,40 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         self.adding_file = None
         self.result_view = None
 
-    def run(self):
+    def run(self, **options):
+        if options.get('command') == 'set_model':
+            self.set_active_model_from_command(options.get('model_name', ''))
+            return
+            
+        if options.get('add_file'):
+            self.add_file(options.get('add_file'))
         self.show_input_panel()
+
+    def append_message(self, message):
+        print("append")
+        self.open_output_view()
+        self.result_view.run_command('append', {'characters': message})
+
+    def add_file(self, file_path, content = None):
+        try:
+            if content != None:
+                file_content = content
+            else:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    file_content = f.read()
+            line = {'role': 'system', 'content': "Here is the content of {}:\n{}".format(file_path, file_content)}
+            if self.added_files.get(file_path, None):
+                line0 = self.added_files[file_path]
+                line0['content'] = line['content']
+                self.append_message("\n[Updated file: {}]\n".format(file_path))
+            else:
+                self.history.append(line)
+                self.adding_file = file_path
+                self.added_files[file_path] = line
+                self.append_message("\n[Attached file: {}]\n".format(file_path))
+
+        except Exception as e:
+            self.append_message("\n[Error loading file: {}]\n".format(str(e)))
 
     def show_input_panel(self):
         self.window.show_input_panel("Deep Chat:", "", self.on_done, None, None)
@@ -79,6 +143,11 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.show_input_panel()
             return
 
+        if clean_message == '/list_file':
+            self.show_file_list()
+            self.show_input_panel()
+            return
+
         if clean_message.startswith('/model'):
             parts = message.split(':')
             if len(parts) > 1:
@@ -89,14 +158,16 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.show_input_panel()
             return
 
+        if clean_message.startswith('/file:'):
+            file_path = message[6:].strip()
+            self.add_file(file_path)
 
         if clean_message.startswith('/file'):
             active_view = self.window.active_view()
             if active_view:
                 file_content = active_view.substr(sublime.Region(0, active_view.size()))
                 file_name = active_view.file_name() or "untitled"
-                self.history.append({'role': 'system', 'content': "Here is the content of {}:\n{}".format(file_name, file_content)})
-                self.adding_file = file_name
+                self.add_file(file_name, file_content)
 
         self.history.append({'role': 'user', 'content': message})
         self.user_message = message
@@ -122,10 +193,6 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         self.window.run_command("focus_neighboring_group") # focus on current group
         self.window.focus_view(self.result_view) # focus again
         sublime.active_window().run_command("move_to_front")
-        
-        if self.adding_file:
-            self.result_view.run_command('append', {'characters': "\n[Attached file: {}]".format(self.adding_file)})
-            self.adding_file = False
 
     def set_active_model_from_command(self, model_name):
         settings = sublime.load_settings('DeepChat.sublime-settings')
@@ -145,6 +212,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                 self.result_view.run_command('append', {'characters': "\n[Error]: Model '{}' not found in settings.\n".format(model_name)})
             print("Model not exists")
         sublime.set_timeout_async(self.update_commands, 0)
+        self.update_status_bar()
 
     def set_active_model(self, model_name):
         settings = sublime.load_settings('DeepChat.sublime-settings')
@@ -156,6 +224,17 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.result_view.run_command('append', {'characters': "\n[Model set to: {}]\n".format(model_name)})
         else:
             self.result_view.run_command('append', {'characters': "\n[Error]: Model '{}' not found in settings.\n".format(model_name)})
+        self.update_status_bar()
+
+    def show_file_list(self):
+        self.open_output_view()
+        if not self.added_files:
+            self.result_view.run_command('append', {'characters': "\n[No files attached in current session]\n"})
+        else:
+            files_text = "\n==== [Attached Files]:\n"
+            for file_path in self.added_files:
+                files_text += "- " + file_path
+            self.result_view.run_command('append', {'characters': files_text})
 
     def show_model_list(self):
         self.open_output_view()
@@ -260,9 +339,6 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             except Exception as e:
                 sublime.error_message("An error occurred: " + str(e))
                 print("An error occurred: " + str(e))
-
-        import time
-    import re  # Add this import
 
     def stream_response(self, request):
         """Handle streaming responses from the LLM with improved buffer handling"""
@@ -538,10 +614,20 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
     def load_last_model(self):
         settings = sublime.load_settings('DeepChat.sublime-settings')
         self.active_model = settings.get('last_active_model', None)
+        self.update_status_bar()
 
     def save_last_model(self, model_name):
         settings = sublime.load_settings('DeepChat.sublime-settings')
         settings.set('last_active_model', model_name)
         sublime.save_settings('DeepChat.sublime-settings')
 
+    def update_status_bar(self,):
+        """Updates the status bar with the current model name."""
+        if self.active_model:
+            status_text = "DeepChat:" + self.active_model
+        else:
+            status_text = "DeepChat: Default Model"  # Or any default message
+
+        for view in self.window.views():
+            view.set_status('deepchat_model', status_text)
 
