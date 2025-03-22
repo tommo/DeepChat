@@ -13,10 +13,10 @@ class DeepChatInsertFileCommand(sublime_plugin.WindowCommand):
     def run(self):
         active_view = self.window.active_view()
         if active_view and active_view.file_name():
-            file_path = active_view.file_name()
-            self.window.run_command("deep_seek_chat", {"add_file":file_path})
+            self.window.run_command("deep_seek_chat", {"add_file": active_view.file_name()})
         else:
             sublime.status_message("No active file")
+
 
 class DeepChatSelectModelCommand(sublime_plugin.WindowCommand):
     def run(self):
@@ -48,15 +48,15 @@ class DeepChatSelectModelCommand(sublime_plugin.WindowCommand):
         selected_model = self.model_names[index]
         self.window.run_command("deep_seek_chat", {"command": "set_model", "model_name": selected_model})
 
+
 class DeepSeekChatCommand(sublime_plugin.WindowCommand):
     def __init__(self, view):
         super().__init__(view)
         self.reset_history()
         self.active_model = None
         self.stopping = False
-        self.load_last_model()
-        # Add thread safety lock
         self.content_lock = threading.Lock()
+        self.load_last_model()
 
     def reset_history(self):
         self.history = [
@@ -73,24 +73,22 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             
         if options.get('add_file'):
             self.add_file(options.get('add_file'))
+        
         self.show_input_panel()
 
-    def append_message(self, message):
-        print("append")
-        self.open_output_view()
-        self.result_view.run_command('append', {'characters': message})
-
-    def add_file(self, file_path, content = None):
+    # File handling methods
+    def add_file(self, file_path, content=None):
         try:
-            if content != None:
+            if content is not None:
                 file_content = content
             else:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     file_content = f.read()
+                    
             line = {'role': 'system', 'content': "Here is the content of {}:\n{}".format(file_path, file_content)}
-            if self.added_files.get(file_path, None):
-                line0 = self.added_files[file_path]
-                line0['content'] = line['content']
+            
+            if file_path in self.added_files:
+                self.added_files[file_path]['content'] = line['content']
                 self.append_message("\n[Updated file: {}]\n".format(file_path))
             else:
                 self.history.append(line)
@@ -101,81 +99,23 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         except Exception as e:
             self.append_message("\n[Error loading file: {}]\n".format(str(e)))
 
+    def show_file_list(self):
+        self.open_output_view()
+        if not self.added_files:
+            self.result_view.run_command('append', {'characters': "\n[No files attached in current session]\n"})
+        else:
+            files_text = "\n==== [Attached Files]:\n"
+            for file_path in self.added_files:
+                files_text += "- {}\n".format(file_path)
+            self.result_view.run_command('append', {'characters': files_text})
+
+    # UI methods
     def show_input_panel(self):
         self.window.show_input_panel("Deep Chat:", "", self.on_done, None, None)
 
-    def find_output_view(self):
-        self.result_view = None
-        for view in self.window.views():
-            if view.name() == "DeepChatResult":
-                self.result_view = view
-                break
-
-    def on_done(self, message):
-        self.find_output_view()
-        clean_message = message.strip().lower()
-
-        if clean_message == '': return
-        if clean_message == '/stop':
-            self.stopping = True
-            self.show_input_panel()
-            return
-        if clean_message == '/clear':
-            if self.result_view:
-                self.result_view.run_command('select_all')
-                self.result_view.run_command('right_delete')
-            self.reset_history()
-            self.show_input_panel()
-            self.show_current_model()
-            return
-
-        if clean_message == '/history':
-            history_text = "\n--------------------\n==== [Current Chat History]:\n"
-            for msg in self.history:
-                if msg['role'] == 'system': continue
-                prefix = "You: " if msg['role'] == 'user' else "Assistant: "
-                history_text += prefix + msg['content'] + "\n\n[End Of History]\n"
-            self.result_view.run_command('append', {'characters': history_text})
-            self.show_input_panel()
-            return
-
-        # Model command
-        if clean_message == '/list':
-            self.show_model_list()
-            self.show_input_panel()
-            return
-
-        if clean_message == '/list_file':
-            self.show_file_list()
-            self.show_input_panel()
-            return
-
-        if clean_message.startswith('/model'):
-            parts = message.split(':')
-            if len(parts) > 1:
-                model_name = parts[1].strip()
-                self.set_active_model(model_name)  # Set the model
-            else:
-                self.result_view.run_command('append', {'characters': "\n[Error]: Invalid /model command format. Use /model:model_name\n"})
-            self.show_input_panel()
-            return
-
-        if clean_message.startswith('/file:'):
-            file_path = message[6:].strip()
-            self.add_file(file_path)
-
-        if clean_message.startswith('/file'):
-            active_view = self.window.active_view()
-            if active_view:
-                file_content = active_view.substr(sublime.Region(0, active_view.size()))
-                file_name = active_view.file_name() or "untitled"
-                self.add_file(file_name, file_content)
-
-        self.history.append({'role': 'user', 'content': message})
-        self.user_message = message
+    def append_message(self, message):
         self.open_output_view()
-        self.send_message()
-        self.show_input_panel()
+        self.result_view.run_command('append', {'characters': message})
 
     def open_output_view(self):
         self.find_output_view()
@@ -187,33 +127,127 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.result_view.set_read_only(False)
             self.result_view.assign_syntax("Packages/DeepChat/ChatResult.tmLanguage")
             self.result_view.settings().set("word_wrap", True)
-            self.show_current_model()  # Show the model on creation
+            self.show_current_model()
 
         self.window.focus_view(self.result_view)
         if self.window.active_group() != self.window.get_view_index(self.result_view)[0]:
             self.window.set_view_index(self.result_view, self.window.active_group(), 0)
-        self.window.run_command("focus_neighboring_group") # focus on current group
-        self.window.focus_view(self.result_view) # focus again
+        self.window.run_command("focus_neighboring_group")
+        self.window.focus_view(self.result_view)
         sublime.active_window().run_command("move_to_front")
 
+    def find_output_view(self):
+        self.result_view = None
+        for view in self.window.views():
+            if view.name() == "DeepChatResult":
+                self.result_view = view
+                break
+
+    # Command handling
+    def on_done(self, message):
+        self.find_output_view()
+        clean_message = message.strip().lower()
+
+        if not clean_message:
+            return
+            
+        # Command handling
+        if clean_message == '/stop':
+            self.stopping = True
+            self.show_input_panel()
+            return
+            
+        if clean_message == '/clear':
+            if self.result_view:
+                self.result_view.run_command('select_all')
+                self.result_view.run_command('right_delete')
+            self.reset_history()
+            self.show_input_panel()
+            self.show_current_model()
+            return
+
+        if clean_message == '/history':
+            self.display_history()
+            return
+
+        if clean_message == '/list':
+            self.show_model_list()
+            self.show_input_panel()
+            return
+
+        if clean_message == '/list_file':
+            self.show_file_list()
+            self.show_input_panel()
+            return
+
+        if clean_message.startswith('/model'):
+            self.handle_model_command(message)
+            return
+
+        if clean_message.startswith('/file:'):
+            file_path = message[6:].strip()
+            self.add_file(file_path)
+            self.show_input_panel()
+            return
+
+        if clean_message.startswith('/file'):
+            self.handle_file_command()
+            self.show_input_panel()
+            return
+
+        # Regular message
+        self.history.append({'role': 'user', 'content': message})
+        self.user_message = message
+        self.open_output_view()
+        self.send_message()
+        self.show_input_panel()
+
+    def display_history(self):
+        history_text = "\n--------------------\n==== [Current Chat History]:\n"
+        for msg in self.history:
+            if msg['role'] == 'system':
+                continue
+            prefix = "You: " if msg['role'] == 'user' else "Assistant: "
+            history_text += prefix + msg['content'] + "\n\n"
+        history_text += "[End Of History]\n"
+        self.result_view.run_command('append', {'characters': history_text})
+        self.show_input_panel()
+
+    def handle_model_command(self, message):
+        parts = message.split(':')
+        if len(parts) > 1:
+            model_name = parts[1].strip()
+            self.set_active_model(model_name)
+        else:
+            self.result_view.run_command('append', 
+                {'characters': "\n[Error]: Invalid /model command format. Use /model:model_name\n"})
+        self.show_input_panel()
+
+    def handle_file_command(self):
+        active_view = self.window.active_view()
+        if active_view:
+            file_content = active_view.substr(sublime.Region(0, active_view.size()))
+            file_name = active_view.file_name() or "untitled"
+            self.add_file(file_name, file_content)
+
+    # Model management
     def set_active_model_from_command(self, model_name):
         settings = sublime.load_settings('DeepChat.sublime-settings')
         available_models = settings.get('models', {})
 
         if model_name in available_models:
             self.active_model = model_name
-            self.save_last_model(model_name)  # Save to view settings
+            self.save_last_model(model_name)
             if not self.result_view:
                 self.find_output_view()
             if self.result_view:
-                self.result_view.run_command('append', {'characters': "\n[Model set to: {}]\n".format(model_name)})
-            else:
-                print("No result view")
+                self.result_view.run_command('append', 
+                    {'characters': "\n[Model set to: {}]\n".format(model_name)})
         else:
             if self.result_view:
-                self.result_view.run_command('append', {'characters': "\n[Error]: Model '{}' not found in settings.\n".format(model_name)})
-            print("Model not exists")
-        # sublime.set_timeout_async(self.update_commands, 0)
+                self.result_view.run_command('append', 
+                    {'characters': "\n[Error]: Model '{}' not found in settings.\n".format(model_name)})
+        
         self.update_status_bar()
 
     def set_active_model(self, model_name):
@@ -222,56 +256,54 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
 
         if model_name in available_models:
             self.active_model = model_name
-            self.save_last_model(model_name) # Save to view settings
-            self.result_view.run_command('append', {'characters': "\n[Model set to: {}]\n".format(model_name)})
+            self.save_last_model(model_name)
+            self.result_view.run_command('append', 
+                {'characters': "\n[Model set to: {}]\n".format(model_name)})
         else:
-            self.result_view.run_command('append', {'characters': "\n[Error]: Model '{}' not found in settings.\n".format(model_name)})
+            self.result_view.run_command('append', 
+                {'characters': "\n[Error]: Model '{}' not found in settings.\n".format(model_name)})
+        
         self.update_status_bar()
-
-    def show_file_list(self):
-        self.open_output_view()
-        if not self.added_files:
-            self.result_view.run_command('append', {'characters': "\n[No files attached in current session]\n"})
-        else:
-            files_text = "\n==== [Attached Files]:\n"
-            for file_path in self.added_files:
-                files_text += "- " + file_path
-            self.result_view.run_command('append', {'characters': files_text})
 
     def show_model_list(self):
         self.open_output_view()
         settings = sublime.load_settings('DeepChat.sublime-settings')
         available_models = settings.get('models', {})
         model_list_text = "\n==== [Available Models]:\n"
+        
         for model_name, model_config in available_models.items():
-            model_list_text += "- {}:   {}\n".format(model_name, model_config.get('description', '...'))
+            model_list_text += "- {}:   {}\n".format(
+                model_name, model_config.get('description', '...'))
+        
         model_list_text += "\n"
         self.result_view.run_command('append', {'characters': model_list_text})
 
     def show_current_model(self):
-        # Show model info in result view
-        if not self.result_view: return
+        if not self.result_view:
+            return
 
         if self.active_model:
-            self.result_view.run_command('append', {'characters': "\n[Current Model: {}]\n".format(self.active_model)})
+            self.result_view.run_command('append', 
+                {'characters': "\n[Current Model: {}]\n".format(self.active_model)})
         else:
-            self.result_view.run_command('append', {'characters': "\n[Using default model. /list to show models]\n"})
+            self.result_view.run_command('append', 
+                {'characters': "\n[Using default model. /list to show models]\n"})
 
+    # API communication
     def send_message(self):
         self.stopping = False
         settings = sublime.load_settings('DeepChat.sublime-settings')
 
-        # Use active model, or default from settings
         model_to_use = self.active_model or settings.get('default_model', 'deepseek-chat')
         available_models = settings.get('models', {})
         model_config = available_models.get(model_to_use)
 
         if not model_config:
-             sublime.error_message("Configuration for model '{}' not found.".format(model_to_use))
-             return
+            sublime.error_message("Configuration for model '{}' not found.".format(model_to_use))
+            return
 
         api_key = model_config.get('api_key', None)
-        url = model_config.get("url", None)  # Use URL from config
+        url = model_config.get("url", None)
 
         if not api_key:
             sublime.error_message("API key not set. Please add your API key to DeepChat.sublime-settings.")
@@ -283,11 +315,11 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
 
         headers = {
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + api_key
+            'Authorization': 'Bearer {}'.format(api_key)
         }
 
         data_dict = {
-            "model": model_config.get("name", model_to_use),  # Fallback to model_to_use
+            "model": model_config.get("name", model_to_use),
             "messages": self.history,
             "max_tokens": model_config.get('max_tokens', 100),
             "temperature": model_config.get('temperature', 0.1),
@@ -296,61 +328,62 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
 
         data_dict.update(model_config.get("extra", {}))
 
-        if  model_config.get("name", model_to_use) == "deepseek-reasoner":
+        if model_config.get("name", model_to_use) == "deepseek-reasoner":
             del data_dict["temperature"]
 
         data_json = json.dumps(data_dict)
         data_bytes = data_json.encode('utf-8')
-
         request = urllib.request.Request(url, data_bytes, headers)
-
-        print(url, headers)
 
         stream = model_config.get('stream', False)
         formatted_message = "\n--------\nQ:  {}\n\n".format(self.user_message)
         self.result_view.run_command('append', {'characters': formatted_message})
+        
         if stream:
-            self.response_buffer = b''
-            self.parse_buffer = b''
-            self.reply = ''
-            self.response_complete = False
-            self.timer_running = False
-            self.previous_reply_length = 0
+            self.setup_streaming()
             threading.Thread(target=self.stream_response, args=(request,)).start()
         else:
-            # Non-streaming mode remains the same
-            try:
-                with urllib.request.urlopen(request) as response:
-                    response_bytes = response.read()
-                    response_str = response_bytes.decode('utf-8')
-                    response_json = json.loads(response_str)
-                    choices = response_json.get('choices', [])
-                    if choices:
-                        reply = choices[0].get('message', {}).get('content', 'No reply from the API.')
-                        self.history.append({'role': 'assistant', 'content': reply})
-                    else:
-                        reply = 'No reply from the API.'
-                    self.display_response(self.user_message, reply)
+            self.handle_non_streaming_response(request)
 
-            except urllib.error.HTTPError as e:
-                sublime.error_message("HTTP Error: %d - %s" % (e.code, e.reason))
-                print("HTTP Error: %d - %s" % (e.code, e.reason))
-            except urllib.error.URLError as e:
-                sublime.error_message("URL Error: %s" % e.reason)
-                print("URL Error: %s" % e.reason)
-            except Exception as e:
-                sublime.error_message("An error occurred: " + str(e))
-                print("An error occurred: " + str(e))
+    def setup_streaming(self):
+        self.response_buffer = b''
+        self.parse_buffer = b''
+        self.reply = ''
+        self.response_complete = False
+        self.timer_running = False
+        self.previous_reply_length = 0
+        self.partial_json = ""
 
+    def handle_non_streaming_response(self, request):
+        try:
+            with urllib.request.urlopen(request) as response:
+                response_bytes = response.read()
+                response_str = response_bytes.decode('utf-8')
+                response_json = json.loads(response_str)
+                choices = response_json.get('choices', [])
+                
+                if choices:
+                    reply = choices[0].get('message', {}).get('content', 'No reply from the API.')
+                    self.history.append({'role': 'assistant', 'content': reply})
+                else:
+                    reply = 'No reply from the API.'
+                
+                self.display_response(self.user_message, reply)
+
+        except urllib.error.HTTPError as e:
+            sublime.error_message("HTTP Error: {} - {}".format(e.code, e.reason))
+        except urllib.error.URLError as e:
+            sublime.error_message("URL Error: {}".format(e.reason))
+        except Exception as e:
+            sublime.error_message("An error occurred: {}".format(str(e)))
+
+    # Streaming response handling
     def stream_response(self, request):
-        """Handle streaming responses from the LLM with improved buffer handling"""
         self.reply = ''
         self.previous_reply_length = 0
         self.last_update_time = time.time()
         self.response_watchdog_active = True
-        self.partial_json = ""  # For handling split JSON
         
-        # Start watchdog timer in a separate thread
         watchdog_thread = threading.Thread(target=self._stream_watchdog)
         watchdog_thread.daemon = True
         watchdog_thread.start()
@@ -361,132 +394,85 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                 
                 while True and not self.stopping:
                     try:
-                        # Set a short read timeout
                         self._safely_set_timeout(response, 5)
-                        chunk = response.read(1024)  # Smaller chunks for more frequent updates
+                        chunk = response.read(1024)
                         self.last_update_time = time.time()
                         
                         if not chunk:
-                            print("End of stream reached")
-                            # Process any remaining data in buffer
                             self._process_buffer(final=True)
                             break
                         
-                        # Append to buffer and process
                         self.parse_buffer += chunk
                         self._process_buffer()
                         
-                        # Start UI update timer if not already running
                         if not self.timer_running:
                             sublime.set_timeout(self.update_view, 100)
                             self.timer_running = True
                         
-                    except (socket.timeout, socket.error) as e:
-                        print("Socket timeout or error:", str(e))
-                        # Try again (watchdog will handle true hangs)
+                    except (socket.timeout, socket.error):
                         continue
-                        
                     except Exception as e:
-                        print("Stream error:", str(e))
+                        print("Stream error: {}".format(str(e)))
                         break
         
         except Exception as e:
-            print("Connection error:", str(e))
             if not self.reply:
-                self.reply = "Error connecting to model: " + str(e)
+                self.reply = "Error connecting to model: {}".format(str(e))
         
         finally:
-            # Clean up and ensure final update
             self.response_watchdog_active = False
-            self._process_partial_json()  # Process any remaining partial JSON
+            self._process_partial_json()
             
             if self.reply:
                 self.response_complete = True
                 self.history.append({'role': 'assistant', 'content': self.reply})
                 sublime.set_timeout(lambda: self.update_view(final=True), 0)
-
-                # Then add a second delayed update to catch any missed content
                 sublime.set_timeout(lambda: self._ensure_complete_update(), 300)
 
-
-    def _ensure_complete_update(self):
-        """Double-check that all content has been added to the view"""
-        with self.content_lock:
-            final_content = self.reply[self.previous_reply_length:]
-            
-        if final_content:
-            print(len(final_content)," chars not yet displayed, adding now")
-            if self.result_view and self.result_view.is_valid():
-                self.result_view.run_command('append', {'characters': final_content})
-                self.previous_reply_length = len(self.reply)
-
     def _process_buffer(self, final=False):
-        """Process received data in buffer"""
-        # Save buffer copy for debugging
-        debug_buffer = self.parse_buffer.decode('utf-8', errors='replace') if final else None
-        
         if b'\n' in self.parse_buffer:
             lines = self.parse_buffer.split(b'\n')
-            # Keep the last line in buffer
             self.parse_buffer = lines.pop()
             
             for line in lines:
                 self._process_line(line)
         elif final and self.parse_buffer:
-            # Process entire buffer on final call
             self._process_line(self.parse_buffer)
             self.parse_buffer = b''
-            
-        # Log final buffer content for debugging
-        if final and debug_buffer:
-            print("Final buffer content:", debug_buffer[:1000])
-
 
     def _process_line(self, line):
-        """Process a single line with improved JSON parsing"""
         if not line.strip():
             return
         
         try:
             line_str = line.decode('utf-8', errors='replace').strip()
             
-            # Handle SSE format (data: {...})
             if line_str.startswith('data: '):
                 if line_str == "data: [DONE]":
                     return
                 
-                json_str = line_str[6:]  # Remove 'data: ' prefix
+                json_str = line_str[6:]
                 self._handle_json_content(json_str)
             
-            # Handle raw JSON lines
             elif line_str.startswith('{'):
                 self._handle_json_content(line_str)
                 
         except Exception as e:
-            print("Error processing line:", str(e), "Line:", line)
-
+            print("Error processing line: {}".format(str(e)))
 
     def _handle_json_content(self, json_str):
-        print(json_str)
-        """Handle JSON content with support for partial JSON"""
         try:
-            # Try to parse as complete JSON
             data = json.loads(json_str)
             self._extract_content(data)
             
         except ValueError:
-            # This might be a partial JSON object
             self.partial_json += json_str
-            
-            # Try to extract complete JSON objects from the accumulated partial JSON
             self._process_partial_json()
 
     def _process_partial_json(self):
-        """Process accumulated partial JSON content"""
         if not self.partial_json:
             return
             
-        # Look for complete JSON objects using regex
         pattern = r'(\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\})'
         matches = re.findall(pattern, self.partial_json)
         
@@ -494,88 +480,58 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             try:
                 data = json.loads(match)
                 self._extract_content(data)
-                # Remove this object from partial_json
                 self.partial_json = self.partial_json.replace(match, '', 1)
             except ValueError:
-                pass  # Not valid JSON
-
+                pass
 
     def _extract_content(self, data):
-        """Extract content with expanded format handling"""
-        # Check for OpenAI/Anthropic style format
         with self.content_lock:
+            # OpenAI/compatible format
             if 'choices' in data:
                 choices = data.get('choices', [])
                 if choices and len(choices) > 0:
                     choice = choices[0]
                     
-                    # OpenAI streaming format
                     if 'delta' in choice:
                         delta = choice.get('delta', {})
-                        if 'content' in delta:
-                            content = delta.get('content')
-                            if content is not None:
-                                self.reply += content
+                        if 'content' in delta and delta['content'] is not None:
+                            self.reply += delta['content']
                     
-                    # Regular format
                     elif 'message' in choice:
                         message = choice.get('message', {})
-                        if 'content' in message:
-                            content = message.get('content')
-                            if content is not None:
-                                self.reply += content
+                        if 'content' in message and message['content'] is not None:
+                            self.reply += message['content']
                     
-                    # Text completion format
-                    elif 'text' in choice:
-                        text = choice.get('text')
-                        if text is not None:
-                            self.reply += text
-                
-
-            # Other API formats
-            elif 'text' in data:
-                text = data.get('text')
-                if text is not None:
-                    self.reply += text
+                    elif 'text' in choice and choice['text'] is not None:
+                        self.reply += choice['text']
             
-            elif 'content' in data:
-                content = data.get('content')
-                if content is not None:
-                    self.reply += content
-                    
-            # Claude/Anthropic format
-            elif 'completion' in data:
-                completion = data.get('completion')
-                if completion is not None:
-                    self.reply += completion
-                    
-            # Mistral/Mixtral format
-            elif 'response' in data:
-                response = data.get('response')
-                if response is not None:
-                    self.reply += response
-
+            # Other API formats
+            elif 'text' in data and data['text'] is not None:
+                self.reply += data['text']
+            
+            elif 'content' in data and data['content'] is not None:
+                self.reply += data['content']
+                
+            elif 'completion' in data and data['completion'] is not None:
+                self.reply += data['completion']
+                
+            elif 'response' in data and data['response'] is not None:
+                self.reply += data['response']
 
     def _stream_watchdog(self):
-        """Watchdog timer to detect and recover from stream hangs"""
         while self.response_watchdog_active:
-            time.sleep(1)  # Check every second
+            time.sleep(1)
             
-            current_time = time.time()
-            elapsed = current_time - self.last_update_time
+            elapsed = time.time() - self.last_update_time
             
-            # If more than 15 seconds without updates, consider it hanging
             if elapsed > 15 and not self.response_complete:
-                print("Watchdog detected potential hang after", elapsed, "seconds")
                 self.response_watchdog_active = False
                 
-                # Force completion of the response
                 if self.reply:
                     sublime.set_timeout(lambda: self._handle_hang(), 0)
                 return
 
     def _handle_hang(self):
-        """Handle a detected stream hang"""
         if not self.response_complete:
             self.reply += "\n\n[Response incomplete - stream timed out]"
             self.response_complete = True
@@ -584,16 +540,21 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.update_view(final=True)
 
     def _safely_set_timeout(self, response, timeout=10):
-        """Safely set timeout on socket if available"""
         try:
             if hasattr(response, 'fp') and response.fp is not None:
                 if hasattr(response.fp, 'raw') and response.fp.raw is not None:
                     if hasattr(response.fp.raw, '_sock') and response.fp.raw._sock is not None:
                         response.fp.raw._sock.settimeout(timeout)
-        except Exception as e:
-            print("Could not set socket timeout:", str(e))
+        except Exception:
+            pass
 
-
+    def _ensure_complete_update(self):
+        with self.content_lock:
+            final_content = self.reply[self.previous_reply_length:]
+            
+        if final_content and self.result_view and self.result_view.is_valid():
+            self.result_view.run_command('append', {'characters': final_content})
+            self.previous_reply_length = len(self.reply)
 
     def update_view(self, final=False):
         try:
@@ -602,63 +563,45 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                 self.timer_running = False
                 return
                 
-            # Get new content with lock protection
             with self.content_lock:
                 new_content = self.reply[self.previous_reply_length:]
                 current_length = len(self.reply)
             
             if new_content:
-                # Debug info
-                print("Adding chunk: ", len(new_content))
-                
-                # Add to view
                 self.result_view.run_command('append', {'characters': new_content})
                 
-                # Update position with lock protection
                 with self.content_lock:
                     self.previous_reply_length = current_length
                     
-                # Auto-scroll
                 self.result_view.sel().clear()
                 self.result_view.sel().add(sublime.Region(self.result_view.size()))
             
-            # Finalize or schedule next update
             if final:
                 if not new_content.endswith('\n'):
                     self.result_view.run_command('append', {'characters': '\n'})
                 self.timer_running = False
             else:
-                # Adaptive timing - faster if content is flowing
                 delay = 30 if new_content else 100
                 self.timer_running = True
                 sublime.set_timeout(self.update_view, delay)
                 
         except Exception as e:
-            print("View update error: ", e)
+            print("View update error: {}".format(e))
             if not final:
                 sublime.set_timeout(self.update_view, 100)
 
-
     def display_response(self, user_message, reply):
-        result_view = None
-        for view in self.window.views():
-            if view.name() == "DeepChatResult":
-                result_view = view
-                break
-
-        if not result_view:
-            result_view = self.window.new_file()
-            result_view.set_name("DeepChatResult")
-            result_view.set_scratch(True)
-            result_view.assign_syntax("Packages/DeepChat/ChatResult.tmLanguage")
-            result_view.set_read_only(False)
+        self.find_output_view()
+        if not self.result_view:
+            self.open_output_view()
 
         formatted_message = "{}\n\n".format(reply)
-        result_view.run_command('append', {'characters': formatted_message})
-        result_view.sel().clear()
-        result_view.sel().add(sublime.Region(result_view.size()))
-        self.window.focus_view(result_view)
+        self.result_view.run_command('append', {'characters': formatted_message})
+        self.result_view.sel().clear()
+        self.result_view.sel().add(sublime.Region(self.result_view.size()))
+        self.window.focus_view(self.result_view)
 
+    # Settings and configuration
     def get_system_message(self):
         settings = sublime.load_settings('DeepChat.sublime-settings')
         return settings.get('system_message', 'You are a helpful assistant.')
@@ -673,12 +616,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         settings.set('last_active_model', model_name)
         sublime.save_settings('DeepChat.sublime-settings')
 
-    def update_status_bar(self,):
-        """Updates the status bar with the current model name."""
-        if self.active_model:
-            status_text = "deepchat:" + self.active_model
-        else:
-            status_text = "deepchat:---"  # Or any default message
+    def update_status_bar(self):
+        status_text = "deepchat:{}".format(self.active_model) if self.active_model else "deepchat:---"
         for view in self.window.views():
             view.set_status('deepchat_model', status_text)
-
