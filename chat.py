@@ -52,9 +52,11 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
     def __init__(self, view):
         super().__init__(view)
         self.reset_history()
-        self.active_model = None  # Store the currently active model
+        self.active_model = None
         self.stopping = False
-        self.load_last_model() # Load last used model
+        self.load_last_model()
+        # Add thread safety lock
+        self.content_lock = threading.Lock()
 
     def reset_history(self):
         self.history = [
@@ -211,7 +213,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             if self.result_view:
                 self.result_view.run_command('append', {'characters': "\n[Error]: Model '{}' not found in settings.\n".format(model_name)})
             print("Model not exists")
-        sublime.set_timeout_async(self.update_commands, 0)
+        # sublime.set_timeout_async(self.update_commands, 0)
         self.update_status_bar()
 
     def set_active_model(self, model_name):
@@ -288,7 +290,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             "model": model_config.get("name", model_to_use),  # Fallback to model_to_use
             "messages": self.history,
             "max_tokens": model_config.get('max_tokens', 100),
-            "temperature": model_config.get('temperature', 0.7),
+            "temperature": model_config.get('temperature', 0.1),
             "stream": model_config.get('stream', False),
         }
 
@@ -403,19 +405,42 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                 self.history.append({'role': 'assistant', 'content': self.reply})
                 sublime.set_timeout(lambda: self.update_view(final=True), 0)
 
+                # Then add a second delayed update to catch any missed content
+                sublime.set_timeout(lambda: self._ensure_complete_update(), 300)
+
+
+    def _ensure_complete_update(self):
+        """Double-check that all content has been added to the view"""
+        with self.content_lock:
+            final_content = self.reply[self.previous_reply_length:]
+            
+        if final_content:
+            print(len(final_content)," chars not yet displayed, adding now")
+            if self.result_view and self.result_view.is_valid():
+                self.result_view.run_command('append', {'characters': final_content})
+                self.previous_reply_length = len(self.reply)
+
     def _process_buffer(self, final=False):
-        """Process the current buffer with improved JSON handling"""
-        # Split on newlines but maintain buffer integrity
+        """Process received data in buffer"""
+        # Save buffer copy for debugging
+        debug_buffer = self.parse_buffer.decode('utf-8', errors='replace') if final else None
+        
         if b'\n' in self.parse_buffer:
             lines = self.parse_buffer.split(b'\n')
-            self.parse_buffer = lines.pop()  # Keep incomplete line in buffer
+            # Keep the last line in buffer
+            self.parse_buffer = lines.pop()
             
             for line in lines:
                 self._process_line(line)
-        elif final:
-            # Process any remaining data if this is the final call
+        elif final and self.parse_buffer:
+            # Process entire buffer on final call
             self._process_line(self.parse_buffer)
             self.parse_buffer = b''
+            
+        # Log final buffer content for debugging
+        if final and debug_buffer:
+            print("Final buffer content:", debug_buffer[:1000])
+
 
     def _process_line(self, line):
         """Process a single line with improved JSON parsing"""
@@ -440,7 +465,9 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         except Exception as e:
             print("Error processing line:", str(e), "Line:", line)
 
+
     def _handle_json_content(self, json_str):
+        print(json_str)
         """Handle JSON content with support for partial JSON"""
         try:
             # Try to parse as complete JSON
@@ -472,58 +499,62 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             except ValueError:
                 pass  # Not valid JSON
 
+
     def _extract_content(self, data):
         """Extract content with expanded format handling"""
         # Check for OpenAI/Anthropic style format
-        if 'choices' in data:
-            choices = data.get('choices', [])
-            if choices and len(choices) > 0:
-                choice = choices[0]
+        with self.content_lock:
+            if 'choices' in data:
+                choices = data.get('choices', [])
+                if choices and len(choices) > 0:
+                    choice = choices[0]
+                    
+                    # OpenAI streaming format
+                    if 'delta' in choice:
+                        delta = choice.get('delta', {})
+                        if 'content' in delta:
+                            content = delta.get('content')
+                            if content is not None:
+                                self.reply += content
+                    
+                    # Regular format
+                    elif 'message' in choice:
+                        message = choice.get('message', {})
+                        if 'content' in message:
+                            content = message.get('content')
+                            if content is not None:
+                                self.reply += content
+                    
+                    # Text completion format
+                    elif 'text' in choice:
+                        text = choice.get('text')
+                        if text is not None:
+                            self.reply += text
                 
-                # OpenAI streaming format
-                if 'delta' in choice:
-                    delta = choice.get('delta', {})
-                    if 'content' in delta:
-                        content = delta.get('content')
-                        if content is not None:
-                            self.reply += content
-                
-                # Regular format
-                elif 'message' in choice:
-                    message = choice.get('message', {})
-                    if 'content' in message:
-                        content = message.get('content')
-                        if content is not None:
-                            self.reply += content
-                
-                # Text completion format
-                elif 'text' in choice:
-                    text = choice.get('text')
-                    if text is not None:
-                        self.reply += text
-        
-        # Sonnet and other non-standard formats
-        elif 'text' in data:
-            text = data.get('text')
-            if text is not None:
-                self.reply += text
-        
-        elif 'content' in data:
-            content = data.get('content')
-            if content is not None:
-                self.reply += content
-                
-        # Claude/Anthropic format
-        elif 'completion' in data:
-            completion = data.get('completion')
-            if completion is not None:
-                self.reply += completion
-                
-        # Mistral/Mixtral format
-        elif 'response' in data:
-            response = data.get('response')
-            if response is not None:
-                self.reply += response
+
+            # Other API formats
+            elif 'text' in data:
+                text = data.get('text')
+                if text is not None:
+                    self.reply += text
+            
+            elif 'content' in data:
+                content = data.get('content')
+                if content is not None:
+                    self.reply += content
+                    
+            # Claude/Anthropic format
+            elif 'completion' in data:
+                completion = data.get('completion')
+                if completion is not None:
+                    self.reply += completion
+                    
+            # Mistral/Mixtral format
+            elif 'response' in data:
+                response = data.get('response')
+                if response is not None:
+                    self.reply += response
+
 
     def _stream_watchdog(self):
         """Watchdog timer to detect and recover from stream hangs"""
@@ -563,28 +594,49 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             print("Could not set socket timeout:", str(e))
 
 
+
     def update_view(self, final=False):
-        if not self.timer_running and not final: return
-        if not self.result_view or not self.result_view.is_valid():
-            self.response_complete = True
-            return
-        if final:
-            new_content = self.reply[self.previous_reply_length:]
-            self.result_view.run_command('append', {'characters': new_content})
-            self.result_view.run_command('append', {'characters': '\n'})
-            self.previous_reply_length = len(self.reply)
-        else:
-            new_content = self.reply[self.previous_reply_length:]
-            self.result_view.run_command('append', {'characters': new_content})
-            self.previous_reply_length = len(self.reply)
-        cursor_pos = self.result_view.sel()[0].b
-        if cursor_pos == self.result_view.size():
-            self.result_view.sel().clear()
-            self.result_view.sel().add(sublime.Region(self.result_view.size()))
-        if not final:
-            sublime.set_timeout(self.update_view, 100)
-        else:
-            self.timer_running = False
+        try:
+            if not self.result_view or not self.result_view.is_valid():
+                self.response_complete = True
+                self.timer_running = False
+                return
+                
+            # Get new content with lock protection
+            with self.content_lock:
+                new_content = self.reply[self.previous_reply_length:]
+                current_length = len(self.reply)
+            
+            if new_content:
+                # Debug info
+                print("Adding chunk: ", len(new_content))
+                
+                # Add to view
+                self.result_view.run_command('append', {'characters': new_content})
+                
+                # Update position with lock protection
+                with self.content_lock:
+                    self.previous_reply_length = current_length
+                    
+                # Auto-scroll
+                self.result_view.sel().clear()
+                self.result_view.sel().add(sublime.Region(self.result_view.size()))
+            
+            # Finalize or schedule next update
+            if final:
+                if not new_content.endswith('\n'):
+                    self.result_view.run_command('append', {'characters': '\n'})
+                self.timer_running = False
+            else:
+                # Adaptive timing - faster if content is flowing
+                delay = 30 if new_content else 100
+                self.timer_running = True
+                sublime.set_timeout(self.update_view, delay)
+                
+        except Exception as e:
+            print("View update error: ", e)
+            if not final:
+                sublime.set_timeout(self.update_view, 100)
 
 
     def display_response(self, user_message, reply):
@@ -624,10 +676,9 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
     def update_status_bar(self,):
         """Updates the status bar with the current model name."""
         if self.active_model:
-            status_text = "DeepChat:" + self.active_model
+            status_text = "deepchat:" + self.active_model
         else:
-            status_text = "DeepChat: Default Model"  # Or any default message
-
+            status_text = "deepchat:---"  # Or any default message
         for view in self.window.views():
             view.set_status('deepchat_model', status_text)
 
