@@ -14,9 +14,9 @@ from datetime import datetime
 from .script_runner import ScriptRunner
 
 #----------------------------------------------------------------
-class DeepChatRescanFunctionsCommand(sublime_plugin.WindowCommand):
+class DeepChatRefreshCommand(sublime_plugin.WindowCommand):
     def run(self):
-        self.window.run_command("deep_seek_chat", {"command": "rescan"})
+        self.window.run_command("deep_seek_chat", {"command": "refresh"})
 
 
 #----------------------------------------------------------------
@@ -72,7 +72,7 @@ class SessionManager:
         if window:
             folders = window.folders()
             if folders:
-                project_dir = os.path.join(folders[0], '.deepchat')
+                project_dir = os.path.join(folders[0], '.deepchat', 'sessions')
                 os.makedirs(project_dir, exist_ok=True)
                 return project_dir
         
@@ -206,14 +206,20 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             else:
                 self.append_message("\n[No active script]\n")
             return
-        if options.get('command') == 'rescan':
+        if options.get('command') == 'refresh':
             self.discover_functions()
-            self.append_message("\n[Rescanned functions: {} found]\n".format(
+            self.append_message("\n[Refreshed functions: {} found]\n".format(
                 len(self.available_functions)
             ))
             if self.available_functions:
                 for cmd_name in self.available_functions.keys():
                     self.append_message("  - {}\n".format(cmd_name))
+            
+            # Reload knowledge base
+            kb_loaded = self.reload_knowledge_base()
+            if kb_loaded:
+                self.append_message("[Knowledge base reloaded]\n")
+            
             self.show_input_panel()
             return
         
@@ -229,26 +235,35 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
 
     # File handling methods
     def add_file(self, file_path, content=None):
+        """Add file reference to history (content loaded on-demand via view_file)"""
         try:
-            if content is not None:
-                file_content = content
+            # Just verify file exists
+            if content is None and not os.path.exists(file_path):
+                self.append_message("\n[Error: File not found: {}]\n".format(file_path))
+                return
+            
+                        # Get file size for reference
+            if content is None:
+                file_size = os.path.getsize(file_path)
             else:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    file_content = f.read()
-                    
-            line = {'role': 'system', 'content': "Here is the content of {}:\n{}".format(file_path, file_content)}
+                file_size = len(content.encode('utf-8'))
+            
+            # Add lightweight reference instead of full content
+            line = {
+                'role': 'system', 
+                'content': "File available: {} (use view_file to read content)".format(file_path)
+            }
             
             if file_path in self.added_files:
-                self.added_files[file_path]['content'] = line['content']
-                self.append_message("\n[Updated file: {}]\n".format(file_path))
+                self.append_message("\n[File already attached: {}]\n".format(file_path))
             else:
                 self.history.append(line)
                 self.adding_file = file_path
                 self.added_files[file_path] = line
-                self.append_message("\n[Attached file: {}]\n".format(file_path))
+                self.append_message("\n[Attached file: {} ({} bytes)]\n".format(file_path, file_size))
 
         except Exception as e:
-            self.append_message("\n[Error loading file: {}]\n".format(str(e)))
+            self.append_message("\n[Error attaching file: {}]\n".format(str(e)))
 
     def show_file_list(self):
         self.open_output_view()
@@ -439,14 +454,32 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                 self.append_message("\n[No active script to continue]\n")
                 self.show_input_panel()
             return
-        if clean_message == '/rescan':
+        if clean_message == '/refresh':
             self.discover_functions()
-            self.append_message("\n[Rescanned functions: {} found]\n".format(
+            self.append_message("\n[Refreshed functions: {} found]\n".format(
                 len(self.available_functions)
             ))
             if self.available_functions:
                 for cmd_name in self.available_functions.keys():
                     self.append_message("  - {}\n".format(cmd_name))
+            
+            # Reload knowledge base
+            kb_loaded = self.reload_knowledge_base()
+            if kb_loaded:
+                self.append_message("[Knowledge base reloaded]\n")
+            
+            self.show_input_panel()
+            return
+        
+        if clean_message.startswith('/read'):
+            active_view = self.window.active_view()
+            if active_view and active_view.file_name():
+                file_path = active_view.file_name()
+                file_content = active_view.substr(sublime.Region(0, active_view.size()))
+                self.add_file(file_path, file_content)
+                self.append_message("\n[Read active file: {}]\n".format(file_path))
+            else:
+                self.append_message("\n[No active file to read]\n")
             self.show_input_panel()
             return
 
@@ -549,7 +582,16 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.append_message("\n[Loaded knowledge: {}]\n".format(sources))
             return True
         
-        return False
+        return False    
+
+    def reload_knowledge_base(self):
+        """Reload knowledge base by removing old and loading fresh"""
+        # Remove existing knowledge base message (at index 1 if exists)
+        if len(self.history) > 1 and self.history[1]['role'] == 'assistant' and 'knowledge base' in self.history[1]['content']:
+            self.history.pop(1)
+        
+        # Load fresh knowledge base
+        return self.try_load_knowledge_base()
 
     def try_auto_resume(self):
         """Try to resume last session"""
@@ -1475,8 +1517,22 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
     def get_system_message(self):
         settings = sublime.load_settings('DeepChat.sublime-settings')
         base_message = settings.get('system_message', 'You are a helpful assistant.')
+        
+        # Add package paths info
+        packages_path = sublime.packages_path()
+        user_path = os.path.join(packages_path, 'User')
+        deepchat_path = os.path.join(packages_path, 'DeepChat')
+        
+        path_info = "\n\nUseful paths:\n"
+        path_info += "- Sublime Text Packages root: {}\n".format(packages_path)
+        path_info += "- User folder: {}\n".format(user_path)
+        path_info += "- DeepChat folder: {}\n".format(deepchat_path)
+        path_info += "- DeepChatFunctions: {}\n".format(os.path.join(user_path, 'DeepChatFunctions'))
+        
+        view_file_hint = "\n\nWhen using view_file, prefer larger line ranges to reduce lookups. Use start_line/end_line parameters effectively. File sizes are shown in attachment messages to help estimate appropriate window sizes."
+        
         continuation_hint = "\n\nIf you need to see results and continue without user input, end your response with <continue/>. This will trigger automatic continuation."
-        return base_message + "\n" + self.get_functions_prompt() + continuation_hint
+        return base_message + "\n" + self.get_functions_prompt() + view_file_hint + continuation_hint + path_info
 
     def load_last_model(self):
         settings = sublime.load_settings('DeepChat.sublime-settings')
