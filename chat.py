@@ -11,6 +11,7 @@ import os
 import hashlib
 
 from datetime import datetime
+from .script_runner import ScriptRunner
 
 #----------------------------------------------------------------
 class DeepChatRescanFunctionsCommand(sublime_plugin.WindowCommand):
@@ -171,6 +172,8 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         self.current_session_id = None
         self.auto_save = True 
         self.auto_resume_attempted = False
+        self.script_runner = ScriptRunner(self)
+        self.in_script_mode = False
         self.history = []
         self.discover_functions()
         self.reset_history()
@@ -191,6 +194,18 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.set_active_model_from_command(options.get('model_name', ''))
             return
 
+        if options.get('command') == 'run_script':
+            script_path = options.get('script_path')
+            if script_path and self.script_runner.load_script(script_path):
+                self.script_runner.execute_script()
+            return
+        
+        if options.get('command') == 'continue_script':
+            if self.script_runner.current_script:
+                self.script_runner.execute_next_step()
+            else:
+                self.append_message("\n[No active script]\n")
+            return
         if options.get('command') == 'rescan':
             self.discover_functions()
             self.append_message("\n[Rescanned functions: {} found]\n".format(
@@ -249,11 +264,15 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
     def show_input_panel(self):
         self.window.show_input_panel("Deep Chat:", "", self.on_done, None, None)
 
-    def append_message(self, message):
-        self.open_output_view()
+    def append_message(self, message, grab_focus=False):
+        if not self.result_view or not self.result_view.is_valid():
+            if not grab_focus:
+                # Don't create view for hint messages
+                return
+            self.open_output_view(grab_focus=grab_focus)
         self.result_view.run_command('append', {'characters': message})
 
-    def open_output_view(self):
+    def open_output_view(self, grab_focus=True):
         self.find_output_view()
 
         if not self.result_view:
@@ -265,12 +284,13 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.result_view.settings().set("word_wrap", True)
             self.show_current_model()
 
-        self.window.focus_view(self.result_view)
-        if self.window.active_group() != self.window.get_view_index(self.result_view)[0]:
-            self.window.set_view_index(self.result_view, self.window.active_group(), 0)
-        self.window.run_command("focus_neighboring_group")
-        self.window.focus_view(self.result_view)
-        sublime.active_window().run_command("move_to_front")
+        if grab_focus:
+            self.window.focus_view(self.result_view)
+            if self.window.active_group() != self.window.get_view_index(self.result_view)[0]:
+                self.window.set_view_index(self.result_view, self.window.active_group(), 0)
+            self.window.run_command("focus_neighboring_group")
+            self.window.focus_view(self.result_view)
+            sublime.active_window().run_command("move_to_front")
 
     def find_output_view(self):
         self.result_view = None
@@ -408,6 +428,17 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.show_input_panel()
             return
 
+        if clean_message == '/script':
+            self.window.run_command('deep_chat_run_script')
+            return
+        
+        if clean_message == '/continue':
+            if self.script_runner.current_script:
+                self.script_runner.execute_next_step()
+            else:
+                self.append_message("\n[No active script to continue]\n")
+                self.show_input_panel()
+            return
         if clean_message == '/rescan':
             self.discover_functions()
             self.append_message("\n[Rescanned functions: {} found]\n".format(
@@ -482,31 +513,41 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         self.show_input_panel()
 
     def try_load_knowledge_base(self):
-        """Load knowledge base from project .deepchat/knowledge.md"""
+        """Load knowledge bases from project and user directories"""
         folders = self.window.folders()
-        if not folders:
-            return False
         
-        kb_path = os.path.join(folders[0], '.deepchat', 'knowledge.md')
-        if not os.path.exists(kb_path):
-            return False
+        kb_contents = []
         
-        try:
-            with open(kb_path, 'r', encoding='utf-8') as f:
-                kb_content = f.read()
+        # Load project knowledge base
+        if folders:
+            project_kb = os.path.join(folders[0], '.deepchat', 'knowledge.md')
+            if os.path.exists(project_kb):
+                try:
+                    with open(project_kb, 'r', encoding='utf-8') as f:
+                        kb_contents.append(('project', f.read()))
+                except Exception as e:
+                    print("Failed to load project knowledge: {}".format(e))
+        
+        # Load user knowledge base
+        user_kb = os.path.join(sublime.packages_path(), 'User', 'DeepChat', 'knowledge.md')
+        if os.path.exists(user_kb):
+            try:
+                with open(user_kb, 'r', encoding='utf-8') as f:
+                    kb_contents.append(('user', f.read()))
+            except Exception as e:
+                print("Failed to load user knowledge: {}".format(e))
+        
+        if kb_contents:
+            combined = '\n\n---\n\n'.join(content for _, content in kb_contents)
+            kb_message = {
+                'role': 'assistant',
+                'content': 'I have access to this knowledge base:\n\n' + combined
+            }
+            self.history.insert(1, kb_message)
             
-            if kb_content.strip():
-                # Insert after system message
-                kb_message = {
-                    'role': 'assistant',
-                    'content': 'I have access to this knowledge base:\n\n' + kb_content
-                }
-                self.history.insert(1, kb_message)
-                
-                self.append_message("\n[Loaded knowledge base: {}]\n".format(kb_path))
-                return True
-        except Exception as e:
-            print("Failed to load knowledge base: {}".format(e))
+            sources = ', '.join(source for source, _ in kb_contents)
+            self.append_message("\n[Loaded knowledge: {}]\n".format(sources))
+            return True
         
         return False
 
@@ -833,6 +874,9 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         prompt += "\ncan have any characters"
         prompt += "\n||>>>"
         prompt += "\n</function_call>"
+
+        prompt += "\nIMPORTANT: function calls are executed at the end of each dialog, you MUST wait for execution result when using reading functions. When waiting for execution result, use <continue/> to resume next step without user's prompt."
+        prompt += "\nIMPORTANT: multipleline argument MUST use the <<<|| and ||>>> delimiters."
         return prompt
 
     def parse_function_calls(self, text):
@@ -869,6 +913,11 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                 continue
             elif line == '||>>>':
                 if current_key and in_multiline:
+                    # Strip leading/trailing empty lines
+                    while multiline_content and not multiline_content[0]:
+                        multiline_content.pop(0)
+                    while multiline_content and not multiline_content[-1]:
+                        multiline_content.pop()
                     content = '\n'.join(multiline_content)
                     if current_key == '@command':
                         result['command'] = content
@@ -940,12 +989,6 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         for call in function_calls:
             result = self.execute_function_call(call)
             results.append(result)
-            
-            # Show execution in chat
-            if result['success']:
-                self.append_message("\n[Executed: {}]\n".format(call.get('command')))
-            else:
-                self.append_message("\n[Error: {}]\n".format(result.get('error')))
         
         return results
 
@@ -1215,6 +1258,15 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.history.append({'role': 'assistant', 'content': self.reply})
             
             if function_results:
+                # Show execution results after response
+                function_calls = self.parse_function_calls(self.reply)
+                for i, result in enumerate(function_results):
+                    call = function_calls[i]
+                    if result['success']:
+                        sublime.set_timeout(lambda c=call: self.append_message("\n[Executed: {}]\n".format(c.get('command'))), 0)
+                    else:
+                        sublime.set_timeout(lambda c=call, r=result: self.append_message("\n[Error: {} - {}]\n".format(c.get('command'), r.get('error'))), 0)
+                
                 results_text = "\n\nFunction execution results:\n{}".format(
                     json.dumps(function_results, indent=2)
                 )
@@ -1227,6 +1279,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             # Check for auto-continue
             if self._check_auto_continue():
                 sublime.set_timeout(lambda: self._trigger_auto_continue(), 500)
+                
     def _process_buffer(self, final=False):
         if b'\n' in self.parse_buffer:
             lines = self.parse_buffer.split(b'\n')
