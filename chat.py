@@ -373,6 +373,22 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.show_input_panel()
             return
 
+        if clean_message == '/settings':
+            settings_path = os.path.join(
+                sublime.packages_path(), 
+                'User', 
+                'DeepChat.sublime-settings'
+            )
+            if not os.path.exists(settings_path):
+                os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+                default_settings = sublime.load_resource(
+                    'Packages/DeepChat/DeepChat.sublime-settings'
+                )
+                with open(settings_path, 'w', encoding='utf-8') as f:
+                    f.write(default_settings)
+            self.window.open_file(settings_path)
+            return
+
         if clean_message == '/auto_resume':
             settings = sublime.load_settings('DeepChat.sublime-settings')
             current = settings.get('auto_resume', True)
@@ -455,22 +471,54 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.save_current_session()
         self.show_input_panel()
 
+    def try_load_knowledge_base(self):
+        """Load knowledge base from project .deepchat/knowledge.md"""
+        folders = self.window.folders()
+        if not folders:
+            return False
+        
+        kb_path = os.path.join(folders[0], '.deepchat', 'knowledge.md')
+        if not os.path.exists(kb_path):
+            return False
+        
+        try:
+            with open(kb_path, 'r', encoding='utf-8') as f:
+                kb_content = f.read()
+            
+            if kb_content.strip():
+                # Insert after system message
+                kb_message = {
+                    'role': 'assistant',
+                    'content': 'I have access to this knowledge base:\n\n' + kb_content
+                }
+                self.history.insert(1, kb_message)
+                
+                self.append_message("\n[Loaded knowledge base: {}]\n".format(kb_path))
+                return True
+        except Exception as e:
+            print("Failed to load knowledge base: {}".format(e))
+        
+        return False
+
     def try_auto_resume(self):
         """Try to resume last session"""
         settings = sublime.load_settings('DeepChat.sublime-settings')
         
         # Check if auto-resume is enabled
         if not settings.get('auto_resume', True):
+            self.try_load_knowledge_base()
             return False
         
         # Get last session ID
         last_session_id = settings.get('last_session_id')
         if not last_session_id:
+            self.try_load_knowledge_base()
             return False
         
         # Try to load it
         session_data = SessionManager.load_session(last_session_id, self.window)
         if not session_data:
+            self.try_load_knowledge_base()
             return False
         
         # Load the session
@@ -764,9 +812,12 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         
         prompt = "\n\nYou have access to these functions:\n"
         for cmd_name, info in self.available_functions.items():
-            prompt += "\n- {}: {}".format(cmd_name, info['description'])
+            prompt += "\n- <function_name>{}<function_name>\n  <desc>{}</desc>\n".format(cmd_name, info['description'])
         
         prompt += "\n\nTo call a function, output: <function_call>{\"command\": \"cmd_name\", \"args\": {...}}</function_call>"
+        prompt += "\n\nDon't add any non-exist parameters, and do fllow the instructions specified in function declarations."
+        prompt += "\n\nEscape <function_call> and </function_call> to avoid incorrect parsing."
+        prompt += "\n\nDon't add extra } at the end"
         return prompt
 
     def parse_function_calls(self, text):
@@ -778,7 +829,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             try:
                 call_data = json.loads(match.strip())
                 calls.append(call_data)
-            except json.JSONDecodeError as e:
+            except ValueError as e:
                 print("Failed to parse function call: {}".format(e))
         
         return calls
@@ -1012,6 +1063,13 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                     )
                     self.history.append({'role': 'system', 'content': results_text})
                 self.auto_save_session()
+                
+                # Check for auto-continue
+                self.reply = reply
+                if self._check_auto_continue():
+                    sublime.set_timeout(lambda: self.display_response(self.user_message, reply), 0)
+                    sublime.set_timeout(lambda: self._trigger_auto_continue(), 500)
+                    return
             else:
                 reply = 'No reply from the API.'
             
@@ -1097,6 +1155,10 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.auto_save_session()
             sublime.set_timeout(lambda: self.update_view(final=True), 0)
             sublime.set_timeout(lambda: self._ensure_complete_update(), 300)
+            
+            # Check for auto-continue
+            if self._check_auto_continue():
+                sublime.set_timeout(lambda: self._trigger_auto_continue(), 500)
     def _process_buffer(self, final=False):
         if b'\n' in self.parse_buffer:
             lines = self.parse_buffer.split(b'\n')
@@ -1151,6 +1213,24 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                 self.partial_json = self.partial_json.replace(match, '', 1)
             except ValueError:
                 pass
+
+    def _trigger_auto_continue(self):
+        """Trigger automatic continuation of conversation"""
+        self.append_message("\n[Auto-continuing...]\n\n")
+        
+        # Add a system message to prompt continuation
+        continue_prompt = "Please continue from where you left off."
+        self.history.append({'role': 'user', 'content': continue_prompt})
+        self.user_message = continue_prompt
+        
+        # Send the continuation request
+        self.send_message_with_retry()
+
+    def _check_auto_continue(self):
+        """Check if response ends with <continue/> tag"""
+        if self.reply.strip().endswith('<continue/>'):
+            return True
+        return False
 
     def _extract_content(self, data):
         with self.content_lock:
@@ -1274,7 +1354,8 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
     def get_system_message(self):
         settings = sublime.load_settings('DeepChat.sublime-settings')
         base_message = settings.get('system_message', 'You are a helpful assistant.')
-        return base_message + "\n" + self.get_functions_prompt()
+        continuation_hint = "\n\nIf you need to see results and continue without user input, end your response with <continue/>. This will trigger automatic continuation."
+        return base_message + "\n" + self.get_functions_prompt() + continuation_hint
 
     def load_last_model(self):
         settings = sublime.load_settings('DeepChat.sublime-settings')
