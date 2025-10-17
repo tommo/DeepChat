@@ -184,6 +184,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         self.adding_file = None
         self.result_view = None
         self.current_session_id = None
+        self.try_load_knowledge_base()
 
     def run(self, **options):
         if options.get('command') == 'set_model':
@@ -387,6 +388,15 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                 with open(settings_path, 'w', encoding='utf-8') as f:
                     f.write(default_settings)
             self.window.open_file(settings_path)
+            return
+            
+        if clean_message == '/source':
+            source_path = os.path.join(
+                sublime.packages_path(), 
+                'DeepChat', 
+                'chat.py'
+            )
+            self.window.open_file(source_path)
             return
 
         if clean_message == '/auto_resume':
