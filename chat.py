@@ -187,13 +187,13 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         if clean_message.startswith('/file:'):
             file_path = message[6:].strip()
             self.add_file(file_path)
-            self.show_input_panel()
-            return
+            # self.show_input_panel()
+            # return
 
         if clean_message.startswith('/file'):
             self.handle_file_command()
-            self.show_input_panel()
-            return
+            # self.show_input_panel()
+            # return
 
         # Regular message
         self.history.append({'role': 'user', 'content': message})
