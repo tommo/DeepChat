@@ -7,8 +7,18 @@ import threading
 import socket
 import re
 import time
+import os
+import hashlib
+
+from datetime import datetime
+
+#----------------------------------------------------------------
+class DeepChatRescanFunctionsCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        self.window.run_command("deep_seek_chat", {"command": "rescan"})
 
 
+#----------------------------------------------------------------
 class DeepChatInsertFileCommand(sublime_plugin.WindowCommand):
     def run(self):
         active_view = self.window.active_view()
@@ -18,6 +28,7 @@ class DeepChatInsertFileCommand(sublime_plugin.WindowCommand):
             sublime.status_message("No active file")
 
 
+#----------------------------------------------------------------
 class DeepChatSelectModelCommand(sublime_plugin.WindowCommand):
     def run(self):
         settings = sublime.load_settings('DeepChat.sublime-settings')
@@ -49,14 +60,121 @@ class DeepChatSelectModelCommand(sublime_plugin.WindowCommand):
         self.window.run_command("deep_seek_chat", {"command": "set_model", "model_name": selected_model})
 
 
+#----------------------------------------------------------------
+class SessionManager:
+    """Manage chat sessions"""
+    
+    @staticmethod
+    def get_sessions_dir(window=None):
+        """Get or create sessions directory - prefer project root"""
+        # Try project root first
+        if window:
+            folders = window.folders()
+            if folders:
+                project_dir = os.path.join(folders[0], '.deepchat')
+                os.makedirs(project_dir, exist_ok=True)
+                return project_dir
+        
+        # Fallback to user directory
+        user_dir = sublime.packages_path()
+        sessions_dir = os.path.join(user_dir, 'User', 'DeepChat', 'sessions')
+        os.makedirs(sessions_dir, exist_ok=True)
+        return sessions_dir
+    
+    @staticmethod
+    def generate_session_id(name=None):
+        """Generate unique session ID"""
+        if name:
+            return re.sub(r'[^\w\-]', '_', name.lower())
+        else:
+            return datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    @staticmethod
+    def save_session(session_id, data, window=None):
+        """Save session to file"""
+        sessions_dir = SessionManager.get_sessions_dir(window)
+        file_path = os.path.join(sessions_dir, '{}.session.json'.format(session_id))
+        
+        session_data = {
+            'id': session_id,
+            'created_at': data.get('created_at', datetime.now().isoformat()),
+            'updated_at': datetime.now().isoformat(),
+            'active_model': data.get('active_model'),
+            'history': data.get('history', []),
+            'added_files': data.get('added_files', {}),
+            'metadata': data.get('metadata', {})
+        }
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(session_data, f, indent=2, ensure_ascii=False)
+        
+        return file_path
+    
+    @staticmethod
+    def load_session(session_id, window=None):
+        """Load session from file"""
+        sessions_dir = SessionManager.get_sessions_dir(window)
+        file_path = os.path.join(sessions_dir, '{}.session.json'.format(session_id))
+        print(file_path)
+        if not os.path.exists(file_path):
+            return None
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    
+    @staticmethod
+    def list_sessions(window=None):
+        """List all available sessions"""
+        sessions_dir = SessionManager.get_sessions_dir(window)
+        sessions = []
+        
+        for filename in os.listdir(sessions_dir):
+            if filename.endswith('.session.json'):
+                file_path = os.path.join(sessions_dir, filename)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        sessions.append({
+                            'id': data.get('id'),
+                            'created_at': data.get('created_at'),
+                            'updated_at': data.get('updated_at'),
+                            'model': data.get('active_model'),
+                            'message_count': len(data.get('history', [])),
+                            'file_path': file_path
+                        })
+                except:
+                    continue
+        
+        sessions.sort(key=lambda x: x.get('updated_at', ''), reverse=True)
+        return sessions
+    
+    @staticmethod
+    def delete_session(session_id, window=None):
+        """Delete a session"""
+        sessions_dir = SessionManager.get_sessions_dir(window)
+        file_path = os.path.join(sessions_dir, '{}.session.json'.format(session_id))
+        
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            return True
+        return False
+
+#----------------------------------------------------------------
 class DeepSeekChatCommand(sublime_plugin.WindowCommand):
     def __init__(self, view):
         super().__init__(view)
-        self.reset_history()
+        self.available_functions = {}
         self.active_model = None
         self.stopping = False
         self.content_lock = threading.Lock()
         self.load_last_model()
+        self.current_session_id = None
+        self.auto_save = True 
+        self.auto_resume_attempted = False
+        self.history = []
+        self.discover_functions()
+        self.reset_history()
+
 
     def reset_history(self):
         self.history = [
@@ -65,12 +183,29 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         self.added_files = {}
         self.adding_file = None
         self.result_view = None
+        self.current_session_id = None
 
     def run(self, **options):
         if options.get('command') == 'set_model':
             self.set_active_model_from_command(options.get('model_name', ''))
             return
-            
+
+        if options.get('command') == 'rescan':
+            self.discover_functions()
+            self.append_message("\n[Rescanned functions: {} found]\n".format(
+                len(self.available_functions)
+            ))
+            if self.available_functions:
+                for cmd_name in self.available_functions.keys():
+                    self.append_message("  - {}\n".format(cmd_name))
+            self.show_input_panel()
+            return
+        
+        if not self.auto_resume_attempted:
+            self.auto_resume_attempted = True
+            if self.try_auto_resume():
+                return
+
         if options.get('add_file'):
             self.add_file(options.get('add_file'))
         
@@ -152,6 +287,64 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             return
             
         # Command handling
+        if clean_message == '/save':
+            self.handle_save_command(message)
+            return
+        
+        if clean_message == '/load':
+            self.show_session_list('load')
+            return
+        
+        if clean_message == '/sessions':
+            self.show_session_list('info')
+            return
+
+        if clean_message.startswith('/new'):
+            if len(self.history) > 1 and self.current_session_id:
+                self.auto_save_session()
+            
+            # Clear and start fresh
+            if self.result_view:
+                self.result_view.run_command('select_all')
+                self.result_view.run_command('right_delete')
+            
+            self.reset_history()
+            # Refresh system message with functions
+            if self.history and self.history[0]['role'] == 'system':
+                self.history[0]['content'] = self.get_system_message()
+            
+            # Handle optional session name
+            parts = message.split(':', 1)
+            if len(parts) > 1:
+                session_name = parts[1].strip()
+                self.current_session_id = SessionManager.generate_session_id(session_name)
+            else:
+                self.current_session_id = None
+            
+            self.show_current_model()
+            session_info = " ({})".format(self.current_session_id) if self.current_session_id else ""
+            self.append_message("\n[New session started{}]\n".format(session_info))
+            self.show_input_panel()
+            return
+        
+        if clean_message.startswith('/save:'):
+            session_name = message[6:].strip()
+            self.save_current_session(session_name)
+            self.show_input_panel()
+            return
+        
+        if clean_message.startswith('/load:'):
+            session_id = message[6:].strip()
+            self.load_session(session_id)
+            self.show_input_panel()
+            return
+        
+        if clean_message.startswith('/delete:'):
+            session_id = message[8:].strip()
+            self.delete_session(session_id)
+            self.show_input_panel()
+            return
+
         if clean_message == '/stop':
             self.stopping = True
             self.show_input_panel()
@@ -177,6 +370,26 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
 
         if clean_message == '/list_file':
             self.show_file_list()
+            self.show_input_panel()
+            return
+
+        if clean_message == '/auto_resume':
+            settings = sublime.load_settings('DeepChat.sublime-settings')
+            current = settings.get('auto_resume', True)
+            settings.set('auto_resume', not current)
+            sublime.save_settings('DeepChat.sublime-settings')
+            self.append_message("\n[Auto-resume: {}]\n".format('ON' if not current else 'OFF'))
+            self.show_input_panel()
+            return
+
+        if clean_message == '/rescan':
+            self.discover_functions()
+            self.append_message("\n[Rescanned functions: {} found]\n".format(
+                len(self.available_functions)
+            ))
+            if self.available_functions:
+                for cmd_name in self.available_functions.keys():
+                    self.append_message("  - {}\n".format(cmd_name))
             self.show_input_panel()
             return
 
@@ -229,6 +442,393 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             file_content = active_view.substr(sublime.Region(0, active_view.size()))
             file_name = active_view.file_name() or "untitled"
             self.add_file(file_name, file_content)
+
+    # Sessions
+    def handle_save_command(self, message):
+        """Handle /save command"""
+        parts = message.split(':', 1)
+        if len(parts) > 1:
+            session_name = parts[1].strip()
+            self.save_current_session(session_name)
+        else:
+            # Save with auto-generated name
+            self.save_current_session()
+        self.show_input_panel()
+
+    def try_auto_resume(self):
+        """Try to resume last session"""
+        settings = sublime.load_settings('DeepChat.sublime-settings')
+        
+        # Check if auto-resume is enabled
+        if not settings.get('auto_resume', True):
+            return False
+        
+        # Get last session ID
+        last_session_id = settings.get('last_session_id')
+        if not last_session_id:
+            return False
+        
+        # Try to load it
+        session_data = SessionManager.load_session(last_session_id, self.window)
+        if not session_data:
+            return False
+        
+        # Load the session
+        self.history = session_data.get('history', [])
+        self.active_model = session_data.get('active_model')
+        self.current_session_id = last_session_id
+        
+        # Restore files
+        self.added_files = {}
+        for file_path, file_data in session_data.get('added_files', {}).items():
+            self.added_files[file_path] = {
+                'role': 'system',
+                'content': file_data.get('content', '')
+            }
+        
+        if self.history and self.history[0]['role'] == 'system':
+            self.history[0]['content'] = self.get_system_message()
+
+        # Display 
+        self.open_output_view()
+        self.append_message("\n# [Auto-resumed: {}]\n".format(last_session_id))
+        
+        # Show last few messages
+        recent_messages = [m for m in self.history if m['role'] != 'system'][-4:]
+        if recent_messages:
+            self.append_message("# [Last messages:]\n\n")
+            self.append_message("```\n")
+            for msg in recent_messages:
+                prefix = "- Q: " if msg['role'] == 'user' else "- A: "
+                preview = msg['content'][:100] + "..." if len(msg['content']) > 100 else msg['content']
+                preview = preview.replace('```', '`')
+                self.append_message("{}{}\n".format(prefix, preview))
+            self.append_message("```\n")
+        
+        self.append_message("\n")
+        self.update_status_bar()
+        self.show_input_panel()
+        return True
+
+    def save_current_session(self, session_name=None):
+        """Save current chat session"""
+        if not self.history or len(self.history) <= 1:
+            self.append_message("\n[Nothing to save]\n")
+            return
+        
+        # Generate or use existing session ID
+        if session_name:
+            session_id = SessionManager.generate_session_id(session_name)
+        elif self.current_session_id:
+            session_id = self.current_session_id
+        else:
+            session_id = SessionManager.generate_session_id()
+        
+        # Prepare session data
+        session_data = {
+            'active_model': self.active_model,
+            'history': self.history,
+            'added_files': {k: {'content': v['content']} for k, v in self.added_files.items()},
+            'metadata': {
+                'message_count': len([h for h in self.history if h['role'] != 'system']),
+                'file_count': len(self.added_files)
+            }
+        }
+        
+        # Load existing session to preserve created_at
+        existing = SessionManager.load_session(session_id)
+        if existing:
+            session_data['created_at'] = existing.get('created_at')
+        
+        # Save
+        file_path = SessionManager.save_session(session_id, session_data, self.window)
+        self.current_session_id = session_id
+        
+        # Save as last session for auto-resume
+        settings = sublime.load_settings('DeepChat.sublime-settings')
+        settings.set('last_session_id', session_id)
+        sublime.save_settings('DeepChat.sublime-settings')
+        
+        self.append_message("\n[Session saved: {}]\n".format(session_id))
+
+    def auto_save_session(self):
+        """Auto-save current session"""
+        if not self.current_session_id:
+            # Create new session on first auto-save
+            self.current_session_id = SessionManager.generate_session_id()
+        
+        if len(self.history) > 1:  # Has messages beyond system message
+            session_data = {
+                'active_model': self.active_model,
+                'history': self.history,
+                'added_files': {k: {'content': v['content']} for k, v in self.added_files.items()},
+                'metadata': {
+                    'message_count': len([h for h in self.history if h['role'] != 'system']),
+                    'file_count': len(self.added_files)
+                }
+            }
+            
+            existing = SessionManager.load_session(self.current_session_id, self.window)
+            if existing:
+                session_data['created_at'] = existing.get('created_at')
+            
+            SessionManager.save_session(self.current_session_id, session_data, self.window)
+
+            settings = sublime.load_settings('DeepChat.sublime-settings')
+            settings.set('last_session_id', self.current_session_id)
+            sublime.save_settings('DeepChat.sublime-settings')
+
+    def load_session(self, session_id):
+        """Load a saved session"""
+        session_data = SessionManager.load_session(session_id)
+        
+        if not session_data:
+            self.append_message("\n[Session '{}' not found]\n".format(session_id))
+            return
+        
+        # Clear current view
+        if self.result_view:
+            self.result_view.run_command('select_all')
+            self.result_view.run_command('right_delete')
+        
+        # Load session data
+        self.history = session_data.get('history', [])
+        self.active_model = session_data.get('active_model')
+        self.current_session_id = session_id
+        
+        # Restore added files
+        self.added_files = {}
+        for file_path, file_data in session_data.get('added_files', {}).items():
+            self.added_files[file_path] = {
+                'role': 'system',
+                'content': file_data.get('content', '')
+            }
+
+        if self.history and self.history[0]['role'] == 'system':
+            self.history[0]['content'] = self.get_system_message()
+        
+        # Display loaded session
+        self.open_output_view()
+        self.append_message("\n[Loaded session: {}]\n".format(session_id))
+        self.append_message("[Created: {}]\n".format(session_data.get('created_at', 'unknown')))
+        self.append_message("[Messages: {}]\n".format(
+            session_data.get('metadata', {}).get('message_count', 0)
+        ))
+        
+        if self.active_model:
+            self.append_message("[Model: {}]\n\n".format(self.active_model))
+        
+        # Display conversation history
+        for msg in self.history:
+            if msg['role'] == 'system':
+                continue
+            
+            prefix = "\n--------\n# Q:  " if msg['role'] == 'user' else ""
+            content = msg['content']
+            
+            if msg['role'] == 'user':
+                self.append_message("{}{}\n\n".format(prefix, content))
+            else:
+                self.append_message("{}\n\n".format(content))
+        
+        self.update_status_bar()
+
+    def show_session_list(self, action='info'):
+        """Show list of available sessions"""
+        sessions = SessionManager.list_sessions(self.window)
+        
+        if not sessions:
+            self.append_message("\n[No saved sessions]\n")
+            if action == 'load':
+                self.show_input_panel()
+            return
+        
+        if action == 'info':
+            # Just display info
+            self.open_output_view()
+            self.append_message("\n==== [Saved Sessions]:\n")
+            for session in sessions:
+                current_marker = " (current)" if session['id'] == self.current_session_id else ""
+                self.append_message("- {}{}\n".format(session['id'], current_marker))
+                self.append_message("  Updated: {}\n".format(session.get('updated_at', 'unknown')))
+                self.append_message("  Messages: {}, Model: {}\n".format(
+                    session.get('message_count', 0),
+                    session.get('model', 'unknown')
+                ))
+            self.append_message("\n")
+            self.show_input_panel()
+        
+        elif action == 'load':
+            # Show quick panel for selection
+            items = []
+            self.session_ids = []
+            
+            for session in sessions:
+                self.session_ids.append(session['id'])
+                current_marker = " (current)" if session['id'] == self.current_session_id else ""
+                items.append([
+                    "{}{}".format(session['id'], current_marker),
+                    "Updated: {} | Messages: {} | Model: {}".format(
+                        session.get('updated_at', 'unknown')[:19],
+                        session.get('message_count', 0),
+                        session.get('model', 'unknown')
+                    )
+                ])
+            
+            self.window.show_quick_panel(
+                items,
+                self.on_session_selected,
+                sublime.MONOSPACE_FONT
+            )
+
+    def on_session_selected(self, index):
+        """Handle session selection from quick panel"""
+        if index == -1:
+            self.show_input_panel()
+            return
+        
+        session_id = self.session_ids[index]
+        self.load_session(session_id)
+        self.show_input_panel()
+
+    def delete_session(self, session_id):
+        """Delete a session"""
+        if SessionManager.delete_session(session_id, self.window):
+            self.append_message("\n[Session '{}' deleted]\n".format(session_id))
+            if self.current_session_id == session_id:
+                self.current_session_id = None
+        else:
+            self.append_message("\n[Session '{}' not found]\n".format(session_id))
+
+    # Functions
+    def discover_functions(self):
+        """Discover available functions from User/DeepChatFunctions"""
+        self.available_functions = {}
+        
+        user_path = os.path.join(sublime.packages_path(), 'User', 'DeepChatFunctions')
+        
+        if not os.path.exists(user_path):
+            os.makedirs(user_path, exist_ok=True)
+            return
+        
+        for filename in os.listdir(user_path):
+            if not filename.endswith('.fn.py'):
+                continue
+            
+            file_path = os.path.join(user_path, filename)
+            
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    code = f.read()
+                
+                namespace = {'sublime': sublime, 'sublime_plugin': sublime_plugin}
+                exec(code, namespace)
+                
+                for item_name, item in namespace.items():
+                    if item_name.startswith('_'):
+                        continue
+                    
+                    # Handle command classes
+                    if isinstance(item, type) and issubclass(item, sublime_plugin.WindowCommand):
+                        # Convert DeepChatFnOpenFileCommand -> open_file
+                        if item_name.startswith('DeepChatFn') and item_name.endswith('Command'):
+                            func_name = item_name[10:-7]  # Strip prefix/suffix
+                            # Convert CamelCase to snake_case
+                            func_name = re.sub(r'(?<!^)(?=[A-Z])', '_', func_name).lower()
+                            
+                            doc = getattr(item, '__doc__', None) or 'No description'
+                            self.available_functions[func_name] = {
+                                'description': doc.strip(),
+                                'type': 'command',
+                                'class': item
+                            }
+                    
+                    # Handle plain functions
+                    elif callable(item):
+                        doc = getattr(item, '__doc__', None) or 'No description'
+                        self.available_functions[item_name] = {
+                            'description': doc.strip(),
+                            'type': 'function',
+                            'callable': item
+                        }
+                        
+            except Exception as e:
+                print("Error loading function {}: {}".format(filename, e))
+
+        if self.history and self.history[0]['role'] == 'system':
+            self.history[0]['content'] = self.get_system_message()
+
+    def get_functions_prompt(self):
+        if not self.available_functions:
+            return ""
+        
+        prompt = "\n\nYou have access to these functions:\n"
+        for cmd_name, info in self.available_functions.items():
+            prompt += "\n- {}: {}".format(cmd_name, info['description'])
+        
+        prompt += "\n\nTo call a function, output: <function_call>{\"command\": \"cmd_name\", \"args\": {...}}</function_call>"
+        return prompt
+
+    def parse_function_calls(self, text):
+        pattern = r'<function_call>(.*?)</function_call>'
+        matches = re.findall(pattern, text, re.DOTALL)
+        
+        calls = []
+        for match in matches:
+            try:
+                call_data = json.loads(match.strip())
+                calls.append(call_data)
+            except json.JSONDecodeError as e:
+                print("Failed to parse function call: {}".format(e))
+        
+        return calls
+
+    def execute_function_call(self, call_data):
+        """Execute a function call and return result"""
+        func_name = call_data.get('command')
+        args = call_data.get('args', {})
+        
+        if func_name not in self.available_functions:
+            return {'success': False, 'error': 'Unknown function: {}'.format(func_name)}
+        
+        func_info = self.available_functions[func_name]
+        
+        try:
+            if func_info['type'] == 'command':
+                # Instantiate and run command
+                cmd = func_info['class'](self.window)
+                result = cmd.run(**args)
+            else:
+                # Call plain function
+                result = func_info['callable'](self.window, **args)
+            
+            if isinstance(result, dict):
+                return result
+            else:
+                return {'success': True, 'result': result}
+                
+        except Exception as e:
+            return {'success': False, 'error': str(e), 'command': func_name}
+
+    def process_response_with_functions(self, response_text):
+        """Process LLM response, execute functions, return results"""
+        function_calls = self.parse_function_calls(response_text)
+        
+        if not function_calls:
+            return None
+        
+        results = []
+        for call in function_calls:
+            result = self.execute_function_call(call)
+            results.append(result)
+            
+            # Show execution in chat
+            if result['success']:
+                self.append_message("\n[Executed: {}]\n".format(call.get('command')))
+            else:
+                self.append_message("\n[Error: {}]\n".format(result.get('error')))
+        
+        return results
 
     # Model management
     def set_active_model_from_command(self, model_name):
@@ -336,7 +936,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         request = urllib.request.Request(url, data_bytes, headers)
 
         stream = model_config.get('stream', False)
-        formatted_message = "\n--------\nQ:  {}\n\n".format(self.user_message)
+        formatted_message = "\n--------\n# Q:  {}\n\n".format(self.user_message)
         self.result_view.run_command('append', {'characters': formatted_message})
         
         if stream:
@@ -364,7 +964,16 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                 
                 if choices:
                     reply = choices[0].get('message', {}).get('content', 'No reply from the API.')
+
+                    function_results = self.process_response_with_functions(reply)
                     self.history.append({'role': 'assistant', 'content': reply})
+
+                    if function_results:
+                        results_text = "\n\nFunction execution results:\n{}".format(
+                            json.dumps(function_results, indent=2)
+                        )
+                        self.history.append({'role': 'system', 'content': results_text})
+                    self.auto_save_session()
                 else:
                     reply = 'No reply from the API.'
                 
@@ -417,15 +1026,24 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         
         except Exception as e:
             if not self.reply:
-                self.reply = "Error connecting to model: {}".format(str(e))
+                self.reply = "Error connecting to model at: {} {}".format(request, str(e))
         
         finally:
             self.response_watchdog_active = False
             self._process_partial_json()
             
             if self.reply:
+                function_results = self.process_response_with_functions(self.reply)
+
                 self.response_complete = True
                 self.history.append({'role': 'assistant', 'content': self.reply})
+                if function_results:
+                    results_text = "\n\nFunction execution results:\n{}".format(
+                        json.dumps(function_results, indent=2)
+                    )
+                    self.history.append({'role': 'system', 'content': results_text})
+
+                self.auto_save_session()
                 sublime.set_timeout(lambda: self.update_view(final=True), 0)
                 sublime.set_timeout(lambda: self._ensure_complete_update(), 300)
 
@@ -537,6 +1155,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.response_complete = True
             self.stopping = True
             self.history.append({'role': 'assistant', 'content': self.reply})
+            self.auto_save_session()
             self.update_view(final=True)
 
     def _safely_set_timeout(self, response, timeout=10):
@@ -604,7 +1223,8 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
     # Settings and configuration
     def get_system_message(self):
         settings = sublime.load_settings('DeepChat.sublime-settings')
-        return settings.get('system_message', 'You are a helpful assistant.')
+        base_message = settings.get('system_message', 'You are a helpful assistant.')
+        return base_message + "\n" + self.get_functions_prompt()
 
     def load_last_model(self):
         settings = sublime.load_settings('DeepChat.sublime-settings')
@@ -620,3 +1240,4 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         status_text = "deepchat:{}".format(self.active_model) if self.active_model else "deepchat:---"
         for view in self.window.views():
             view.set_status('deepchat_model', status_text)
+
