@@ -812,27 +812,85 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         
         prompt = "\n\nYou have access to these functions:\n"
         for cmd_name, info in self.available_functions.items():
-            prompt += "\n- <function_name>{}<function_name>\n  <desc>{}</desc>\n".format(cmd_name, info['description'])
+            prompt += "\n\n>>>> {}: {}".format(cmd_name, info['description'])
         
-        prompt += "\n\nTo call a function, output: <function_call>{\"command\": \"cmd_name\", \"args\": {...}}</function_call>"
-        prompt += "\n\nDon't add any non-exist parameters, and do fllow the instructions specified in function declarations."
-        prompt += "\n\nEscape <function_call> and </function_call> to avoid incorrect parsing."
-        prompt += "\n\nDon't add extra } at the end"
+        prompt += "\n\nTo call a function, use this format:"
+        prompt += "\n<function_call>"
+        prompt += "\n@command: function_name"
+        prompt += "\narg_singleline: value"
+        prompt += "\narg_multiline: <<<||"
+        prompt += "\nmultiline value here"
+        prompt += "\ncan have any characters"
+        prompt += "\n||>>>"
+        prompt += "\n</function_call>"
         return prompt
 
     def parse_function_calls(self, text):
+        """Parse simple key-value format instead of JSON"""
         pattern = r'<function_call>(.*?)</function_call>'
         matches = re.findall(pattern, text, re.DOTALL)
         
         calls = []
         for match in matches:
             try:
-                call_data = json.loads(match.strip())
+                call_data = self._parse_kv_format(match.strip())
                 calls.append(call_data)
-            except ValueError as e:
+            except Exception as e:
                 print("Failed to parse function call: {}".format(e))
         
         return calls
+
+    def _parse_kv_format(self, text):
+        """Parse key-value format with multiline support"""
+        lines = text.split('\n')
+        result = {'args': {}}
+        current_key = None
+        multiline_content = []
+        in_multiline = False
+        
+        for line in lines:
+            if not line:
+                continue
+            
+            # Check for multiline delimiters
+            if line == '<<<||':
+                in_multiline = True
+                multiline_content = []
+                continue
+            elif line == '||>>>':
+                if current_key and in_multiline:
+                    content = '\n'.join(multiline_content)
+                    if current_key == '@command':
+                        result['command'] = content
+                    else:
+                        result['args'][current_key] = content
+                in_multiline = False
+                current_key = None
+                continue
+            
+            # Collect multiline content
+            if in_multiline:
+                multiline_content.append(line)
+                continue
+            
+            # Parse key: value
+            if ':' in line:
+                key, value = line.split(':', 1)
+                key = key.strip()
+                value = value.strip()
+                
+                if key == '@command':
+                    result['command'] = value
+                else:
+                    # Handle multiline marker
+                    if value == '<<<||':
+                        current_key = key
+                        in_multiline = True
+                        multiline_content = []
+                    else:
+                        result['args'][key] = value
+        
+        return result
 
     def execute_function_call(self, call_data):
         """Execute a function call and return result"""
@@ -1219,7 +1277,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         self.append_message("\n[Auto-continuing...]\n\n")
         
         # Add a system message to prompt continuation
-        continue_prompt = "Please continue from where you left off."
+        continue_prompt = "[Continue from where you left off]"
         self.history.append({'role': 'user', 'content': continue_prompt})
         self.user_message = continue_prompt
         
