@@ -412,7 +412,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         self.history.append({'role': 'user', 'content': message})
         self.user_message = message
         self.open_output_view()
-        self.send_message()
+        self.send_message_with_retry()
         self.show_input_panel()
 
     def display_history(self):
@@ -890,10 +890,9 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                 {'characters': "\n[Using default model. /list to show models]\n"})
 
     # API communication
-    def send_message(self):
-        self.stopping = False
+    def send_message_with_retry(self, max_retries=3):
+        """Send message with retry logic"""
         settings = sublime.load_settings('DeepChat.sublime-settings')
-
         model_to_use = self.active_model or settings.get('default_model', 'deepseek-chat')
         available_models = settings.get('models', {})
         model_config = available_models.get(model_to_use)
@@ -902,16 +901,60 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             sublime.error_message("Configuration for model '{}' not found.".format(model_to_use))
             return
 
+        request = self._prepare_request(model_config)
+        if not request:
+            return
+
+        stream = model_config.get('stream', False)
+        
+        # Display user message
+        formatted_message = "\n--------\n# Q:  {}\n\n".format(self.user_message)
+        self.result_view.run_command('append', {'characters': formatted_message})
+        
+        # Run in background thread
+        thread = threading.Thread(
+            target=self._send_message_thread,
+            args=(request, stream, max_retries)
+        )
+        thread.daemon = True
+        thread.start()
+    
+    def _send_message_thread(self, request, stream, max_retries):
+        """Background thread for sending messages"""
+        for attempt in range(max_retries):
+            try:
+                if stream:
+                    self.setup_streaming()
+                    self._stream_response_sync(request)
+                else:
+                    self._handle_non_streaming_response_sync(request)
+                return  # Success
+                
+            except (urllib.error.URLError, socket.error, urllib.error.HTTPError) as e:
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2
+                    msg = "\n[Connection error, retrying in {}s... (attempt {}/{}): {}]\n".format(
+                        wait_time, attempt + 1, max_retries, str(e))
+                    sublime.set_timeout(lambda m=msg: self.append_message(m), 0)
+                    time.sleep(wait_time)
+                else:
+                    error_msg = "\n[Connection failed after {} attempts: {}]\n".format(
+                        max_retries, str(e))
+                    sublime.set_timeout(lambda m=error_msg: self.append_message(m), 0)
+                    return
+
+    def _prepare_request(self, model_config):
+        """Prepare the API request"""
         api_key = model_config.get('api_key', None)
         url = model_config.get("url", None)
 
         if not api_key:
             sublime.error_message("API key not set. Please add your API key to DeepChat.sublime-settings.")
-            return
+            return None
 
         if not url:
             sublime.error_message("API URL not set")
-            return
+            return None
 
         headers = {
             'Content-Type': 'application/json',
@@ -919,7 +962,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         }
 
         data_dict = {
-            "model": model_config.get("name", model_to_use),
+            "model": model_config.get("name", self.active_model),
             "messages": self.history,
             "max_tokens": model_config.get('max_tokens', 100),
             "temperature": model_config.get('temperature', 0.1),
@@ -928,22 +971,18 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
 
         data_dict.update(model_config.get("extra", {}))
 
-        if model_config.get("name", model_to_use) == "deepseek-reasoner":
+        if model_config.get("name", self.active_model) == "deepseek-reasoner":
             del data_dict["temperature"]
 
         data_json = json.dumps(data_dict)
         data_bytes = data_json.encode('utf-8')
-        request = urllib.request.Request(url, data_bytes, headers)
+        return urllib.request.Request(url, data_bytes, headers)
 
-        stream = model_config.get('stream', False)
-        formatted_message = "\n--------\n# Q:  {}\n\n".format(self.user_message)
-        self.result_view.run_command('append', {'characters': formatted_message})
-        
-        if stream:
-            self.setup_streaming()
-            threading.Thread(target=self.stream_response, args=(request,)).start()
-        else:
-            self.handle_non_streaming_response(request)
+    def send_message(self):
+        """Entry point - delegates to retry mechanism"""
+        self.stopping = False
+        self.send_message_with_retry()
+
 
     def setup_streaming(self):
         self.response_buffer = b''
@@ -954,31 +993,34 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         self.previous_reply_length = 0
         self.partial_json = ""
 
+    def _handle_non_streaming_response_sync(self, request):
+        """Handle non-streaming response - raises exceptions for retry"""
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response_bytes = response.read()
+            response_str = response_bytes.decode('utf-8')
+            response_json = json.loads(response_str)
+            choices = response_json.get('choices', [])
+            
+            if choices:
+                reply = choices[0].get('message', {}).get('content', 'No reply from the API.')
+                function_results = self.process_response_with_functions(reply)
+                self.history.append({'role': 'assistant', 'content': reply})
+
+                if function_results:
+                    results_text = "\n\nFunction execution results:\n{}".format(
+                        json.dumps(function_results, indent=2)
+                    )
+                    self.history.append({'role': 'system', 'content': results_text})
+                self.auto_save_session()
+            else:
+                reply = 'No reply from the API.'
+            
+            sublime.set_timeout(lambda: self.display_response(self.user_message, reply), 0)
+
     def handle_non_streaming_response(self, request):
+        """Legacy wrapper - no longer used"""
         try:
-            with urllib.request.urlopen(request) as response:
-                response_bytes = response.read()
-                response_str = response_bytes.decode('utf-8')
-                response_json = json.loads(response_str)
-                choices = response_json.get('choices', [])
-                
-                if choices:
-                    reply = choices[0].get('message', {}).get('content', 'No reply from the API.')
-
-                    function_results = self.process_response_with_functions(reply)
-                    self.history.append({'role': 'assistant', 'content': reply})
-
-                    if function_results:
-                        results_text = "\n\nFunction execution results:\n{}".format(
-                            json.dumps(function_results, indent=2)
-                        )
-                        self.history.append({'role': 'system', 'content': results_text})
-                    self.auto_save_session()
-                else:
-                    reply = 'No reply from the API.'
-                
-                self.display_response(self.user_message, reply)
-
+            self._handle_non_streaming_response_sync(request)
         except urllib.error.HTTPError as e:
             sublime.error_message("HTTP Error: {} - {}".format(e.code, e.reason))
         except urllib.error.URLError as e:
@@ -987,7 +1029,27 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             sublime.error_message("An error occurred: {}".format(str(e)))
 
     # Streaming response handling
-    def stream_response(self, request):
+    def stream_response_with_retry(self, request, max_retries=3):
+        """Stream response with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                self.stream_response(request)
+                return
+            except (urllib.error.URLError, socket.error) as e:
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2
+                    sublime.set_timeout(lambda: self.append_message(
+                        "\n[Connection error, retrying in {}s...]\n".format(wait_time)
+                    ), 0)
+                    time.sleep(wait_time)
+                else:
+                    sublime.set_timeout(lambda: self.append_message(
+                        "\n[Connection failed after {} attempts: {}]\n".format(max_retries, str(e))
+                    ), 0)
+                    return
+
+    def _stream_response_sync(self, request):
+        """Stream response synchronously - raises exceptions for retry"""
         self.reply = ''
         self.previous_reply_length = 0
         self.last_update_time = time.time()
@@ -997,56 +1059,44 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         watchdog_thread.daemon = True
         watchdog_thread.start()
         
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                self.parse_buffer = b''
-                
-                while True and not self.stopping:
-                    try:
-                        self._safely_set_timeout(response, 5)
-                        chunk = response.read(1024)
-                        self.last_update_time = time.time()
-                        
-                        if not chunk:
-                            self._process_buffer(final=True)
-                            break
-                        
-                        self.parse_buffer += chunk
-                        self._process_buffer()
-                        
-                        if not self.timer_running:
-                            sublime.set_timeout(self.update_view, 100)
-                            self.timer_running = True
-                        
-                    except (socket.timeout, socket.error):
-                        continue
-                    except Exception as e:
-                        print("Stream error: {}".format(str(e)))
-                        break
-        
-        except Exception as e:
-            if not self.reply:
-                self.reply = "Error connecting to model at: {} {}".format(request, str(e))
-        
-        finally:
-            self.response_watchdog_active = False
-            self._process_partial_json()
+        # This will raise exceptions to be caught by retry mechanism
+        with urllib.request.urlopen(request, timeout=30) as response:
+            self.parse_buffer = b''
             
-            if self.reply:
-                function_results = self.process_response_with_functions(self.reply)
+            while True and not self.stopping:
+                self._safely_set_timeout(response, 5)
+                chunk = response.read(1024)
+                self.last_update_time = time.time()
+                
+                if not chunk:
+                    self._process_buffer(final=True)
+                    break
+                
+                self.parse_buffer += chunk
+                self._process_buffer()
+                
+                if not self.timer_running:
+                    sublime.set_timeout(self.update_view, 100)
+                    self.timer_running = True
+        
+        # Finalize
+        self.response_watchdog_active = False
+        self._process_partial_json()
+        
+        if self.reply:
+            function_results = self.process_response_with_functions(self.reply)
+            self.response_complete = True
+            self.history.append({'role': 'assistant', 'content': self.reply})
+            
+            if function_results:
+                results_text = "\n\nFunction execution results:\n{}".format(
+                    json.dumps(function_results, indent=2)
+                )
+                self.history.append({'role': 'system', 'content': results_text})
 
-                self.response_complete = True
-                self.history.append({'role': 'assistant', 'content': self.reply})
-                if function_results:
-                    results_text = "\n\nFunction execution results:\n{}".format(
-                        json.dumps(function_results, indent=2)
-                    )
-                    self.history.append({'role': 'system', 'content': results_text})
-
-                self.auto_save_session()
-                sublime.set_timeout(lambda: self.update_view(final=True), 0)
-                sublime.set_timeout(lambda: self._ensure_complete_update(), 300)
-
+            self.auto_save_session()
+            sublime.set_timeout(lambda: self.update_view(final=True), 0)
+            sublime.set_timeout(lambda: self._ensure_complete_update(), 300)
     def _process_buffer(self, final=False):
         if b'\n' in self.parse_buffer:
             lines = self.parse_buffer.split(b'\n')
