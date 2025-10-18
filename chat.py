@@ -1150,7 +1150,22 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                     return
 
     def _prepare_request(self, model_config):
-        """Prepare the API request"""
+        """Prepare the API request"""        
+        # Check request size limit
+        settings = sublime.load_settings('DeepChat.sublime-settings')
+        max_tokens = settings.get('max_request_tokens', 100000)
+        
+        # Rough token estimation: 1 token ≈ 4 chars
+        total_chars = sum(len(msg.get('content', '')) for msg in self.history)
+        estimated_tokens = total_chars // 4
+        
+        if estimated_tokens > max_tokens:
+            error_msg = "\n[Error: Request too large (~{} tokens, limit: {}). Use /clear or /new to start fresh]\n".format(
+                estimated_tokens, max_tokens
+            )
+            sublime.set_timeout(lambda: self.append_message(error_msg), 0)
+            return None
+        
         api_key = model_config.get('api_key', None)
         url = model_config.get("url", None)
 
