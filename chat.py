@@ -460,8 +460,9 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                 len(self.available_functions)
             ))
             if self.available_functions:
+                print("found tool functions:")
                 for cmd_name in self.available_functions.keys():
-                    self.append_message("  - {}\n".format(cmd_name))
+                    print("  - {}\n".format(cmd_name))
             
             # Reload knowledge base
             kb_loaded = self.reload_knowledge_base()
@@ -917,8 +918,9 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         prompt += "\n||>>>"
         prompt += "\n</function_call>"
 
-        prompt += "\nIMPORTANT: function calls are executed at the end of each dialog, you MUST wait for execution result when using reading functions. When waiting for execution result, use <continue/> to resume next step without user's prompt."
         prompt += "\nIMPORTANT: multipleline argument MUST use the <<<|| and ||>>> delimiters."
+        prompt += "\nIMPORTANT: function calls are executed at the end of each dialog, you MUST wait for execution result when using reading functions. "
+        prompt += "\nIMPORTANT: PLEASE USE <continue/> when you need execution result for next moves, to avoid unnecessary back-and-forth with the user"
         return prompt
 
     def parse_function_calls(self, text):
@@ -1525,14 +1527,18 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         
         path_info = "\n\nUseful paths:\n"
         path_info += "- Sublime Text Packages root: {}\n".format(packages_path)
+        path_info += "- Project folder: use window_summary function to find out\n"
         path_info += "- User folder: {}\n".format(user_path)
         path_info += "- DeepChat folder: {}\n".format(deepchat_path)
         path_info += "- DeepChatFunctions: {}\n".format(os.path.join(user_path, 'DeepChatFunctions'))
+        path_info += "- DeepChatScripts: {}\\n".format(os.path.join(deepchat_path, 'scripts'))
         
-        view_file_hint = "\n\nWhen using view_file, prefer larger line ranges to reduce lookups. Use start_line/end_line parameters effectively. File sizes are shown in attachment messages to help estimate appropriate window sizes."
+        view_file_hint = "\n\nWhen using view_file, prefer larger line ranges (200+) to reduce lookups. Use start_line/end_line parameters effectively. File sizes are shown in attachment messages to help estimate appropriate window sizes."
+        
+        write_file_hint = "\n\nRequest confirmation before create files."
         
         continuation_hint = "\n\nIf you need to see results and continue without user input, end your response with <continue/>. This will trigger automatic continuation."
-        return base_message + "\n" + self.get_functions_prompt() + view_file_hint + continuation_hint + path_info
+        return base_message + "\n" + self.get_functions_prompt() + view_file_hint + continuation_hint + path_info + write_file_hint
 
     def load_last_model(self):
         settings = sublime.load_settings('DeepChat.sublime-settings')
