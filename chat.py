@@ -386,6 +386,11 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.show_input_panel()
             return
             
+        if clean_message.startswith('/testcall'):
+            result = self.process_response_with_functions(clean_message[9:].strip())
+            self.append_message("\n[Test Result]: \n {}\n".format(result))
+            return
+
         if clean_message == '/clear':
             if self.result_view:
                 self.result_view.run_command('select_all')
@@ -948,6 +953,8 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         
         for line in lines:
             if not line:
+                if in_multiline:
+                    multiline_content.append('')
                 continue
             
             # Check for multiline delimiters
@@ -1225,7 +1232,14 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             if choices:
                 reply = choices[0].get('message', {}).get('content', 'No reply from the API.')
                 function_results = self.process_response_with_functions(reply)
-                self.history.append({'role': 'assistant', 'content': reply})
+                # Keep first 150 characters instead of 100 bytes
+                clean_reply = re.sub(
+                    r'<function_call>(.{0,150}).*?</function_call>', 
+                    r'<function_call>\1...</function_call>', 
+                    reply, 
+                    flags=re.DOTALL
+                ).strip()
+                self.history.append({'role': 'assistant', 'content': clean_reply})
 
                 if function_results:
                     results_text = "\n\nFunction execution results:\n{}".format(
@@ -1314,7 +1328,13 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         if self.reply:
             function_results = self.process_response_with_functions(self.reply)
             self.response_complete = True
-            self.history.append({'role': 'assistant', 'content': self.reply})
+            clean_reply = re.sub(
+                r'<function_call>(.{0,150}).*?</function_call>', 
+                r'<function_call>\1...</function_call>', 
+                self.reply, 
+                flags=re.DOTALL
+            ).strip()
+            self.history.append({'role': 'assistant', 'content': clean_reply})
             
             if function_results:
                 # Show execution results after response
@@ -1395,9 +1415,6 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                 pass
 
     def _trigger_auto_continue(self):
-        """Trigger automatic continuation of conversation"""
-        self.append_message("\n[Auto-continuing...]\n\n")
-        
         # Add a system message to prompt continuation
         continue_prompt = "[Continue from where you left off]"
         self.history.append({'role': 'user', 'content': continue_prompt})
