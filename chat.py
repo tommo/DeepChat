@@ -28,7 +28,6 @@ class DeepChatInsertFileCommand(sublime_plugin.WindowCommand):
         else:
             sublime.status_message("No active file")
 
-
 #----------------------------------------------------------------
 class DeepChatSelectModelCommand(sublime_plugin.WindowCommand):
     def run(self):
@@ -181,7 +180,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
 
     def reset_history(self):
         self.history = [
-            {'role': 'system', 'content': self.get_system_message()}
+            {'role': 'system', 'content': self.get_system_message()},
         ]
         self.added_files = {}
         self.adding_file = None
@@ -412,6 +411,12 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         if clean_message == '/list_file':
             self.show_file_list()
             self.show_input_panel()
+            return
+        
+        if clean_message == '/system_hint':
+            self.append_message("\n[System Hint]:\n{}\n".format(
+                self.get_system_message()
+            ))
             return
 
         if clean_message == '/settings':
@@ -914,23 +919,26 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             prompt += "\n\n>>>> {}: {}".format(cmd_name, info['description'])
         
         prompt += "\n\nTo call a function, use this format:"
-        prompt += "\n<function_call>"
+        prompt += "\n\n```"
+        prompt += "\n<toolfunction_call>"
         prompt += "\n@command: function_name"
-        prompt += "\narg_singleline: value"
-        prompt += "\narg_multiline: <<<||"
+        prompt += "\nshort_arg_name: value"
+        prompt += "\nmultiline_arg_name: <<<||"
         prompt += "\nmultiline value here"
         prompt += "\ncan have any characters"
         prompt += "\n||>>>"
-        prompt += "\n</function_call>"
+        prompt += "\n</toolfunction_call>"
+        prompt += "\n```"
 
-        prompt += "\nIMPORTANT: multipleline argument MUST use the <<<|| and ||>>> delimiters."
-        prompt += "\nIMPORTANT: function calls are executed at the end of each dialog, you MUST wait for execution result when using reading functions. "
-        prompt += "\nIMPORTANT: PLEASE USE <continue/> when you need execution result for next moves, to avoid unnecessary back-and-forth with the user"
+        prompt += "\nIMPORTANT: function calls are executed after your turn. You MUST cut the answer and wait for user input after a call."
+        prompt += "\nIMPORTANT: Make sure if the call is read-only. If it's a read-only call, use <wait_function_return/> to request user to skip next input."
+        prompt += "\nRequest confirmation before create or edit files. Stop tool function attempts after 3 failures."
+        
         return prompt
 
     def parse_function_calls(self, text):
         """Parse simple key-value format instead of JSON"""
-        pattern = r'<function_call>(.*?)</function_call>'
+        pattern = r'<toolfunction_call>(.*?)</toolfunction_call>'
         matches = re.findall(pattern, text, re.DOTALL)
         
         calls = []
@@ -1234,8 +1242,8 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
                 function_results = self.process_response_with_functions(reply)
                 # Keep first 150 characters instead of 100 bytes
                 clean_reply = re.sub(
-                    r'<function_call>(.{0,150}).*?</function_call>', 
-                    r'<function_call>\1...</function_call>', 
+                    r'<toolfunction_call>(.{0,150}).*?</toolfunction_call>', 
+                    r'<toolfunction_call>\1...</toolfunction_call>', 
                     reply, 
                     flags=re.DOTALL
                 ).strip()
@@ -1329,8 +1337,8 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             function_results = self.process_response_with_functions(self.reply)
             self.response_complete = True
             clean_reply = re.sub(
-                r'<function_call>(.{0,150}).*?</function_call>', 
-                r'<function_call>\1...</function_call>', 
+                r'<toolfunction_call>(.{0,150}).*?</toolfunction_call>', 
+                r'<toolfunction_call>\1...</toolfunction_call>', 
                 self.reply, 
                 flags=re.DOTALL
             ).strip()
@@ -1424,8 +1432,8 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         self.send_message_with_retry()
 
     def _check_auto_continue(self):
-        """Check if response ends with <continue/> tag"""
-        if self.reply.strip().endswith('<continue/>'):
+        """Check if response ends with <wait_function_return/> tag"""
+        if self.reply.strip().endswith('<wait_function_return/>'):
             return True
         return False
 
@@ -1548,10 +1556,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         self.window.focus_view(self.result_view)
 
     # Settings and configuration
-    def get_system_message(self):
-        settings = sublime.load_settings('DeepChat.sublime-settings')
-        base_message = settings.get('system_message', 'You are a helpful assistant.')
-        
+    def get_agentic_hints(self):
         # Add package paths info
         packages_path = sublime.packages_path()
         user_path = os.path.join(packages_path, 'User')
@@ -1565,12 +1570,15 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         path_info += "- DeepChatFunctions: {}\n".format(os.path.join(user_path, 'DeepChatFunctions'))
         path_info += "- DeepChatScripts: {}\\n".format(os.path.join(deepchat_path, 'scripts'))
         
-        view_file_hint = "\n\nWhen using view_file, prefer larger line ranges (200+) to reduce lookups. Use start_line/end_line parameters effectively. File sizes are shown in attachment messages to help estimate appropriate window sizes."
-        
-        write_file_hint = "\n\nRequest confirmation before create files."
-        
-        continuation_hint = "\n\nIf you need to see results and continue without user input, end your response with <continue/>. This will trigger automatic continuation."
-        return base_message + "\n" + self.get_functions_prompt() + view_file_hint + continuation_hint + path_info + write_file_hint
+        return self.get_functions_prompt() + path_info
+
+    def get_system_message(self):
+        settings = sublime.load_settings('DeepChat.sublime-settings')
+        base_message = settings.get('system_message', 'You are a helpful assistant.')
+        output = base_message
+        output += "\n"
+        output += self.get_agentic_hints()
+        return output
 
     def load_last_model(self):
         settings = sublime.load_settings('DeepChat.sublime-settings')
