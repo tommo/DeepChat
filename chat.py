@@ -115,7 +115,6 @@ class SessionManager:
         """Load session from file"""
         sessions_dir = SessionManager.get_sessions_dir(window)
         file_path = os.path.join(sessions_dir, '{}.session.json'.format(session_id))
-        print(file_path)
         if not os.path.exists(file_path):
             return None
         
@@ -174,6 +173,8 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         self.script_runner = ScriptRunner(self)
         self.in_script_mode = False
         self.history = []
+        self.message_id = 0
+        self.labels = {}  # label_name -> message_id
         self.discover_functions()
         self.reset_history()
 
@@ -185,8 +186,25 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         self.added_files = {}
         self.adding_file = None
         self.result_view = None
+        self.history_view = None
         self.current_session_id = None
+        self.message_id = 0
+        self.labels = {}
         self.try_load_knowledge_base()
+
+    def add_message_to_history(self, role, content, label=None):
+        """Add message to history with auto-incrementing ID"""
+        self.message_id += 1
+        msg = {
+            'role': role,
+            'content': content,
+            'id': self.message_id
+        }
+        if label:
+            self.labels[label] = self.message_id
+            msg['label'] = label
+        self.history.append(msg)
+        return self.message_id
 
     def run(self, **options):
         if options.get('command') == 'set_model':
@@ -312,6 +330,72 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             if view.name() == "DeepChatResult":
                 self.result_view = view
                 break
+    def display_history(self):
+        """Display conversation history in separate view"""
+        self.open_history_view()
+        
+        # Clear existing content
+        self.history_view.run_command('select_all')
+        self.history_view.run_command('right_delete')
+        
+        # Header
+        header = "==== Conversation History ====\n"
+        header += "Session: {}\n".format(self.current_session_id or "unsaved")
+        header += "Model: {}\n".format(self.active_model or "none")
+        header += "Messages: {}\n\n".format(len(self.history))
+        self.history_view.run_command('append', {'characters': header})
+        
+        # Display each message
+        for i, msg in enumerate(self.history):
+            role = msg.get('role', 'unknown')
+            content = msg.get('content', '')
+            msg_id = msg.get('id', i)
+            label = msg.get('label', '')
+            
+            # Format message header
+            if role == 'system':
+                prefix = "# system:"
+            elif role == 'user':
+                prefix = "\n----\n# [User] [{}]:".format(msg_id)
+                if label:
+                    prefix += " <{}>".format(label)
+            else:
+                prefix = "# [Answer]: "
+            
+            # Truncate long content for preview
+            preview = content[:200]
+            if len(content) > 200:
+                preview += "..."
+            
+            msg_text = "{}\n{}\n\n".format(prefix, preview)
+            self.history_view.run_command('append', {'characters': msg_text})
+        
+        # Footer with instructions
+        footer = "\n==== Commands ====\n"
+        footer += "Use /rewind:<id|label> to rewind to a message\n"
+        self.history_view.run_command('append', {'characters': footer})
+        
+        self.show_input_panel()
+    def open_history_view(self):
+        """Open/focus the history view"""
+        # Find existing history view
+        history_view = None
+        for view in self.window.views():
+            if view.name() == "DeepChatHistory":
+                history_view = view
+                break
+        
+        if not history_view:
+            history_view = self.window.new_file()
+            history_view.set_name("DeepChatHistory")
+            history_view.set_scratch(True)
+            history_view.set_read_only(False)
+            history_view.assign_syntax("Packages/Markdown/Markdown.sublime-syntax")
+            history_view.settings().set("word_wrap", True)
+        
+        self.history_view = history_view
+        self.window.focus_view(history_view)
+        return history_view
 
     # Command handling
     def on_done(self, message):
@@ -401,6 +485,25 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
 
         if clean_message == '/history':
             self.display_history()
+            return
+
+        if clean_message.startswith('/rewind:'):
+            target = message[8:].strip()
+            self.rewind_to(target)
+            self.show_input_panel()
+            return
+        
+        if clean_message.startswith('/label:'):
+            parts = message[7:].split(None, 1)
+            if len(parts) == 2:
+                label_name, user_msg = parts
+                self.add_message_to_history('user', user_msg, label=label_name)
+                self.user_message = user_msg
+                self.open_output_view()
+                self.send_message_with_retry()
+            else:
+                self.append_message("\n[Error: /label:name <message>]\n")
+            self.show_input_panel()
             return
 
         if clean_message == '/list':
@@ -510,22 +613,48 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             # return
 
         # Regular message
-        self.history.append({'role': 'user', 'content': message})
+        self.add_message_to_history('user', message)
         self.user_message = message
         self.open_output_view()
         self.send_message_with_retry()
         self.show_input_panel()
 
-    def display_history(self):
-        history_text = "\n--------------------\n==== [Current Chat History]:\n"
-        for msg in self.history:
-            if msg['role'] == 'system':
-                continue
-            prefix = "You: " if msg['role'] == 'user' else "Assistant: "
-            history_text += prefix + msg['content'] + "\n\n"
-        history_text += "[End Of History]\n"
-        self.result_view.run_command('append', {'characters': history_text})
-        self.show_input_panel()
+    
+    def rewind_to(self, target):
+        """Rewind history to specific ID or label"""
+        try:
+            # Try as label first
+            if target in self.labels:
+                target_id = self.labels[target]
+            else:
+                target_id = int(target)
+            
+            # Find message with target ID
+            new_history = []
+            found = False
+            for msg in self.history:
+                new_history.append(msg)
+                if msg.get('id') == target_id:
+                    found = True
+                    break
+            
+            if found:
+                self.history = new_history
+                # Rebuild labels
+                self.labels = {}
+                for msg in self.history:
+                    if 'label' in msg:
+                        self.labels[msg['label']] = msg['id']
+                
+                self.append_message("\n[Rewound to ID {} ({} messages)]\n".format(
+                    target_id, len(self.history)
+                ))
+                self.auto_save_session()
+            else:
+                self.append_message("\n[ID/label '{}' not found]\n".format(target))
+        
+        except ValueError:
+            self.append_message("\n[Invalid ID: {}]\n".format(target))
 
     def handle_model_command(self, message):
         parts = message.split(':')
@@ -732,7 +861,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
 
     def load_session(self, session_id):
         """Load a saved session"""
-        session_data = SessionManager.load_session(session_id)
+        session_data = SessionManager.load_session(session_id, self.window)
         
         if not session_data:
             self.append_message("\n[Session '{}' not found]\n".format(session_id))
@@ -864,7 +993,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             return
         
         for filename in os.listdir(user_path):
-            if not filename.endswith('.fn.py'):
+            if not filename.endswith('.py'):
                 continue
             
             file_path = os.path.join(user_path, filename)
@@ -1129,7 +1258,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         stream = model_config.get('stream', False)
         
         # Display user message
-        formatted_message = "\n--------\n# Q:  {}\n\n".format(self.user_message)
+        formatted_message = "\n--------\n# Q [{}]:  {}\n\n".format(self.message_id, self.user_message)
         self.result_view.run_command('append', {'characters': formatted_message})
         
         # Run in background thread
@@ -1139,6 +1268,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         )
         thread.daemon = True
         thread.start()
+    
     
     def _send_message_thread(self, request, stream, max_retries):
         """Background thread for sending messages"""
@@ -1240,20 +1370,20 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             if choices:
                 reply = choices[0].get('message', {}).get('content', 'No reply from the API.')
                 function_results = self.process_response_with_functions(reply)
-                # Keep first 150 characters instead of 100 bytes
                 clean_reply = re.sub(
-                    r'<toolfunction_call>(.{0,150}).*?</toolfunction_call>', 
+                    r'<toolfunction_call>(.{0,100}).*?</toolfunction_call>', 
                     r'<toolfunction_call>\1...</toolfunction_call>', 
                     reply, 
                     flags=re.DOTALL
                 ).strip()
-                self.history.append({'role': 'assistant', 'content': clean_reply})
+                self.add_message_to_history('assistant', clean_reply)
 
                 if function_results:
                     results_text = "\n\nFunction execution results:\n{}".format(
                         json.dumps(function_results, indent=2)
                     )
                     self.history.append({'role': 'system', 'content': results_text})
+
                 self.auto_save_session()
                 
                 # Check for auto-continue
@@ -1425,7 +1555,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
     def _trigger_auto_continue(self):
         # Add a system message to prompt continuation
         continue_prompt = "[Continue from where you left off]"
-        self.history.append({'role': 'user', 'content': continue_prompt})
+        self.add_message_to_history('user', continue_prompt)
         self.user_message = continue_prompt
         
         # Send the continuation request
@@ -1489,7 +1619,7 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
             self.reply += "\n\n[Response incomplete - stream timed out]"
             self.response_complete = True
             self.stopping = True
-            self.history.append({'role': 'assistant', 'content': self.reply})
+            self.add_message_to_history('assistant', self.reply)
             self.auto_save_session()
             self.update_view(final=True)
 
@@ -1576,6 +1706,8 @@ class DeepSeekChatCommand(sublime_plugin.WindowCommand):
         settings = sublime.load_settings('DeepChat.sublime-settings')
         base_message = settings.get('system_message', 'You are a helpful assistant.')
         output = base_message
+        output += "\n"
+        output += "VERY IMPORTANT: Don't try to make up answers if you don't know. Just say 'I don't know'.\n"
         output += "\n"
         output += self.get_agentic_hints()
         return output
